@@ -79,8 +79,8 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "7.5.0-v27-retire-legacy-range"
-BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL_V27"
+VERSION = "7.6.0-v28-real-margin-single-pyramid"
+BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL_V28"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
@@ -146,7 +146,14 @@ PYRAMID_GRID_PHASES = tuple(
 )
 PYRAMID_GRID_COUNT = max(1, len(PYRAMID_GRID_PHASES))
 PYRAMID_GRID_CAPITAL_SHARE = D(1) / D(PYRAMID_GRID_COUNT)
-PYRAMID_ADD_BANKROLL_PCT = D(os.getenv("PYRAMID_ADD_BANKROLL_PCT", "0.05"))
+# V28: adicionais PYRAMID usam margem física livre da conta, não bankroll/equity virtual.
+# Compatibilidade: se PYRAMID_ADD_FREE_MARGIN_PCT não existir, aceita o antigo
+# PYRAMID_ADD_BANKROLL_PCT como fallback de configuração.
+PYRAMID_ADD_FREE_MARGIN_PCT = D(os.getenv(
+    "PYRAMID_ADD_FREE_MARGIN_PCT",
+    os.getenv("PYRAMID_ADD_BANKROLL_PCT", "0.05"),
+))
+PYRAMID_ADD_BANKROLL_PCT = PYRAMID_ADD_FREE_MARGIN_PCT  # alias legado
 PYRAMID_BTC_MIN_ADD_NOTIONAL_USD = D(os.getenv("PYRAMID_BTC_MIN_ADD_NOTIONAL_USD", "100"))
 PYRAMID_LEVERAGE = int(os.getenv("PYRAMID_LEVERAGE", "10"))
 PYRAMID_MAX_LOSS_USD = D(os.getenv("PYRAMID_MAX_LOSS_USD", "10"))
@@ -1021,7 +1028,8 @@ def fresh_state() -> Dict[str, Any]:
         "protection_blocks": {},
         "range": {s: empty_range_state(s) for s in SYMBOLS},
         "pyramid": {f"{s}:{side}": empty_pyramid_state(s, side) for s in SYMBOLS for side in ("LONG", "SHORT")},
-        "pyramid_grids": {f"{s}:{side}:G{i}": empty_pyramid_grid_state(s, side, f"G{i}", phase) for s in SYMBOLS for side in ("LONG", "SHORT") for i, phase in enumerate(PYRAMID_GRID_PHASES)},
+        # V28: bucket mantido apenas para compatibilidade com V25-V27; novos G0 não são criados.
+        "pyramid_grids": {},
         "symbol_owner": {s: None for s in SYMBOLS},
         "last_wallet": {},
         "maintenance": {"completed_emergency_actions": []},
@@ -1054,11 +1062,8 @@ class StateStore:
             for side in ("LONG", "SHORT"):
                 pkey = f"{s}:{side}"
                 st["pyramid"].setdefault(pkey, empty_pyramid_state(s, side))
-                for i, phase in enumerate(PYRAMID_GRID_PHASES):
-                    gkey = f"{s}:{side}:G{i}"
-                    st["pyramid_grids"].setdefault(
-                        gkey, empty_pyramid_grid_state(s, side, f"G{i}", phase)
-                    )
+                # V28: não cria novos pyramid_grids. Estados G0 antigos, se existirem,
+                # são tratados de forma segura no startup.
         st["version"] = VERSION
         return st
 
@@ -1271,6 +1276,39 @@ class FillLedger:
                 (symbol, side),
             ).fetchone()
         return dec(row[0] if row else 0)
+
+    def rename_strategy(self, old_strategy_id: str, new_strategy_id: str,
+                        symbol: Optional[str] = None, side: Optional[str] = None) -> int:
+        """Renomeia ownership lógico no ledger sem tocar na posição física."""
+        if old_strategy_id == new_strategy_id:
+            return 0
+        with self.lock:
+            where = ["strategy_id=?"]
+            args: List[Any] = [old_strategy_id]
+            if symbol:
+                where.append("symbol=?"); args.append(symbol)
+            if side:
+                where.append("position_side=?"); args.append(side)
+            clause = " AND ".join(where)
+            row = self.db.execute(
+                f"SELECT COUNT(*) FROM lots WHERE {clause}", tuple(args)
+            ).fetchone()
+            count = int(row[0] if row else 0)
+            self.db.execute(
+                f"UPDATE lots SET strategy_id=? WHERE {clause}",
+                tuple([new_strategy_id] + args),
+            )
+            self.db.execute(
+                "UPDATE orders SET strategy_id=? WHERE strategy_id=?",
+                (new_strategy_id, old_strategy_id),
+            )
+            self.db.commit()
+        if count:
+            logger.warning(
+                f"LEDGER STRATEGY MIGRATION V28 | {old_strategy_id} -> {new_strategy_id} "
+                f"| symbol={symbol or '*'} side={side or '*'} lots={count}"
+            )
+        return count
 
     def bootstrap_from_state(self, store: 'StateStore') -> int:
         with self.lock:
@@ -2605,7 +2643,7 @@ class RangeEngine:
                 f"RANGE RETIRE V27 | {self.symbol} | fechando somente lotes RANGE legados; "
                 f"legs={len(b.get('legs', []) or [])}"
             )
-            self._close_basket(price, "MIGRATION_RETIRE_RANGE_V27", protect_after=False)
+            self._close_basket(price, "MIGRATION_RETIRE_RANGE_V28", protect_after=False)
             st = self.st()
         # Operational recovery is intentionally discarded because this strategy is retired.
         # Historical PnL/equity remain recorded in the state/trade ledger.
@@ -2615,11 +2653,11 @@ class RangeEngine:
         st["protect_anchor"] = None
         st["failures"] = 0
         st["recovery_deficit"] = "0"
-        st["last_result"] = "RETIRED_V27"
+        st["last_result"] = "RETIRED_V28"
         st["last_update"] = now_iso()
         self.store.save()
         release_owner(self.store, self.symbol, self.id)
-        logger.warning(f"RANGE RETIRED V27 | {self.symbol} | novas_entradas=DESABILITADAS_PERMANENTEMENTE")
+        logger.warning(f"RANGE RETIRED V28 | {self.symbol} | novas_entradas=DESABILITADAS_PERMANENTEMENTE")
 
     def _reverse(self, price: Decimal) -> None:
         st = self.st(); b = st.get("basket")
@@ -2879,15 +2917,18 @@ class RangeEngine:
 class PyramidEngine:
     """Escada direcional persistente baseada exclusivamente em deslocamentos de 1% do anchor.
 
-    LONG:  +1%, +2%, +3% ...; SHORT: -1%, -2%, -3% ...
-    O primeiro nivel usa PYRAMID_INITIAL_NOTIONAL_USD. Para BTC, os niveis posteriores
-    usam no minimo PYRAMID_BTC_MIN_ADD_NOTIONAL_USD (padrao USD 100) enquanto 5% do
-    caixa/equity virtual ainda for menor que esse piso; quando 5% superar o piso, cada
-    nova adicao passa a usar 5% do caixa/equity total. ETH/HYPE preservam a regra
-    anterior de 5% do bankroll como margem virtual multiplicada pela alavancagem.
-    As regras da exchange arredondam para step/min-notional quando necessario.
-    Recuos nunca reduzem a posição. O único encerramento automático desta estratégia
-    é o limite de perda da cesta (caixa virtual).
+    LONG: +1%, +2%, +3% ...; SHORT: -1%, -2%, -3% ...
+    V28 separa contabilidade lógica de capacidade física:
+      - nível 1 usa PYRAMID_INITIAL_NOTIONAL_USD;
+      - níveis seguintes usam uma fração da MARGEM FÍSICA LIVRE REAL da conta
+        (availableBalance - MIN_FREE_WALLET_BUFFER_USD), convertida em notional
+        pela alavancagem PYRAMID;
+      - BTC mantém PYRAMID_BTC_MIN_ADD_NOTIONAL_USD como piso;
+      - bankroll/equity virtual permanece para PnL e limite de perda, mas não
+        aumenta sozinho o tamanho das novas adições.
+    As regras da exchange arredondam para step/min-notional quando necessário.
+    Recuos nunca reduzem posição. O encerramento automático permanece pelo
+    limite explícito PYRAMID_MAX_LOSS_USD.
     """
     def __init__(self, symbol: str, side: str, client: AsterClient, md: MarketData,
                  news: NewsFilter, account: AccountManager, exe: ExecutionEngine, store: StateStore,
@@ -2934,20 +2975,25 @@ class PyramidEngine:
             total += gross - fees
         return total
 
-    def _desired_notional(self, level: int) -> Decimal:
+    def _desired_notional(self, level: int, free_margin: Optional[Decimal] = None) -> Decimal:
         share = dec(self.st().get("capital_share", "1"))
         if level <= 1:
             return PYRAMID_INITIAL_NOTIONAL_USD * share
+
+        if free_margin is None:
+            free_margin = self.account.free_margin()
+        free_margin = max(D(0), dec(free_margin))
+        margin_budget = free_margin * PYRAMID_ADD_FREE_MARGIN_PCT * share
+        desired = margin_budget * D(PYRAMID_LEVERAGE)
+
         if self.symbol == "BTCUSDT":
-            st = self.st()
-            cash_total = max(PYRAMID_BANKROLL_USD * share, dec(st.get("equity")))
-            five_pct_cash = cash_total * PYRAMID_ADD_BANKROLL_PCT
-            return max(PYRAMID_BTC_MIN_ADD_NOTIONAL_USD * share, five_pct_cash)
-        return PYRAMID_BANKROLL_USD * share * PYRAMID_ADD_BANKROLL_PCT * D(PYRAMID_LEVERAGE)
+            desired = max(PYRAMID_BTC_MIN_ADD_NOTIONAL_USD * share, desired)
+        return desired
 
     def _sizing(self, price: Decimal, level: int) -> Optional[Dict[str, Any]]:
         self.account.sync()
-        desired = self._desired_notional(level)
+        free = self.account.free_margin()
+        desired = self._desired_notional(level, free_margin=free)
         if desired <= 0 or price <= 0:
             return None
         lev = max(MIN_LEVERAGE, min(PYRAMID_LEVERAGE, MAX_REQUESTED_LEVERAGE,
@@ -2955,19 +3001,23 @@ class PyramidEngine:
         qty = self.exe.rules.qty(self.symbol, desired / price, price)
         actual_notional = qty * price
         margin = actual_notional / D(lev)
-        free = self.account.free_margin()
         if margin > free:
-            logger.warning(f"PYRAMID MARGIN BLOCK V21 | {self.id} | level={level} margin={margin} free={free}")
+            logger.warning(f"PYRAMID MARGIN BLOCK V28 | {self.id} | level={level} margin={margin} free={free}")
             return None
         current_symbol = self.account.current_symbol_notional(self.symbol)
         symbol_cap = configured_max_total_symbol_notional(self.symbol)
         if current_symbol + actual_notional > symbol_cap:
-            logger.warning(f"PYRAMID SYMBOL CAP V21 | {self.id} | current={current_symbol} add={actual_notional} cap={symbol_cap}")
+            logger.warning(f"PYRAMID SYMBOL CAP V28 | {self.id} | current={current_symbol} add={actual_notional} cap={symbol_cap}")
             return None
         return {"leverage": lev, "qty": qty, "price": price, "notional": actual_notional,
                 "margin": margin, "estimated_adverse_loss": D(0), "target_profit": D(0),
                 "recovery_level": 0, "desired_notional_override": desired,
-                "recovery_multiplier": "1", "meta": {"engine": "PYRAMID_1PCT", "level": level}}
+                "recovery_multiplier": "1", "meta": {
+                    "engine": "PYRAMID_1PCT", "level": level,
+                    "sizing_base": "INITIAL_FIXED" if level <= 1 else "REAL_FREE_MARGIN",
+                    "free_margin_before": str(free),
+                    "add_free_margin_pct": str(PYRAMID_ADD_FREE_MARGIN_PCT),
+                }}
 
     def _entry_allowed(self) -> bool:
         if not self.allow_new_entries:
@@ -2976,10 +3026,10 @@ class PyramidEngine:
             return False
         gate_ok, gate_reason = self.store.entry_allowed()
         if not gate_ok:
-            logger.warning(f"PYRAMID ENTRY GATE V21 | {self.id} | {gate_reason}")
+            logger.warning(f"PYRAMID ENTRY GATE V28 | {self.id} | {gate_reason}")
             return False
         if not self.md.is_fresh(self.symbol):
-            logger.warning(f"PYRAMID STALE PRICE V21 | {self.id} | age_s={self.md.age(self.symbol):.3f}")
+            logger.warning(f"PYRAMID STALE PRICE V28 | {self.id} | age_s={self.md.age(self.symbol):.3f}")
             return False
         if PYRAMID_APPLY_NEWS_FILTER:
             blocked, why = self.news.blocked()
@@ -3006,7 +3056,7 @@ class PyramidEngine:
         st["last_update"] = now_iso()
         self.store.save()
         logger.warning(
-            f"PYRAMID OPEN V21 | {self.id} | level={level} trigger={trigger} fill={leg.get('entry_price')} "
+            f"PYRAMID OPEN V28 | {self.id} | level={level} trigger={trigger} fill={leg.get('entry_price')} "
             f"qty={leg.get('qty')} notional={leg.get('notional')} leverage={sizing['leverage']}x "
             f"anchor={st.get('anchor')} next_level={st['next_level']}"
         )
@@ -3022,14 +3072,14 @@ class PyramidEngine:
         remaining = [leg for leg in legs if str(leg.get("id")) not in closed_ids]
         st["legs"] = remaining
         st["realized_pnl"] = str(dec(st.get("realized_pnl")) + total)
-        st["equity"] = str(PYRAMID_BANKROLL_USD + dec(st.get("realized_pnl")))
+        st["equity"] = str(PYRAMID_BANKROLL_USD * dec(st.get("capital_share", "1")) + dec(st.get("realized_pnl")))
         st["last_unrealized"] = "0"
         st["last_net_pnl"] = str(total)
         st["stopped"] = bool(PYRAMID_STOP_AFTER_MAX_LOSS)
         st["stop_reason"] = f"MAX_LOSS_REACHED net_before_close={net_before_close} realized_close={total}"
         st["last_update"] = now_iso()
         self.store.save()
-        logger.critical(f"PYRAMID STOP V21 | {self.id} | net_before_close={net_before_close} realized={total} remaining_legs={len(remaining)} stopped={st['stopped']}")
+        logger.critical(f"PYRAMID STOP V28 | {self.id} | net_before_close={net_before_close} realized={total} remaining_legs={len(remaining)} stopped={st['stopped']}")
 
     def diagnostic(self, price: Optional[Decimal]) -> Dict[str, Any]:
         """Retorna o motivo operacional atual para não haver nova entrada."""
@@ -3043,7 +3093,8 @@ class PyramidEngine:
             return {"status": "WAITING_ANCHOR", "reason": "ANCHOR_NOT_SET", "mark": price}
         level = max(1, int(st.get("next_level", 1)))
         trigger = self._trigger_price(anchor, level)
-        desired = self._desired_notional(level)
+        free_margin = self.account.free_margin()
+        desired = self._desired_notional(level, free_margin=free_margin)
         if trigger <= 0:
             return {"status": "INVALID_TRIGGER", "reason": "TRIGGER_LE_ZERO", "mark": price, "anchor": anchor, "level": level}
         crossed = self._crossed(price, trigger)
@@ -3062,6 +3113,8 @@ class PyramidEngine:
             "trigger": trigger, "remaining_pct": remain_pct, "level": level,
             "desired_notional": desired, "legs": len(st.get("legs", []) or []),
             "equity": dec(st.get("equity")), "net": dec(st.get("last_net_pnl")),
+            "free_margin": free_margin,
+            "sizing_base": "INITIAL_FIXED" if level <= 1 else "REAL_FREE_MARGIN",
         }
 
     def tick(self, price: Decimal) -> None:
@@ -3076,7 +3129,7 @@ class PyramidEngine:
             st["next_level"] = max(1, int(st.get("next_level", 1)))
             st["last_update"] = now_iso()
             self.store.save()
-            logger.warning(f"PYRAMID ANCHOR V26 | {self.id} | phase={self.grid_phase} anchor={st['anchor']} | first_trigger={self._trigger_price(dec(st['anchor']), 1)}")
+            logger.warning(f"PYRAMID ANCHOR V28 | {self.id} | phase={self.grid_phase} anchor={st['anchor']} | first_trigger={self._trigger_price(dec(st['anchor']), 1)}")
             return
 
         legs = st.get("legs", []) or []
@@ -3191,9 +3244,8 @@ def run_internal_regression_checks() -> None:
     assert RANGE_SIGNAL_MODE == "VOLATILITY_ONLY"
     assert RANGE_ENGINE_ENABLED is False
     assert PYRAMID_GRID_PHASES == (D("0"),)
-    assert sum((PYRAMID_GRID_CAPITAL_SHARE for _ in PYRAMID_GRID_PHASES), D(0)) == D(1)
-    assert len(set(PYRAMID_GRID_PHASES)) == len(PYRAMID_GRID_PHASES)
-    assert all(D(0) <= x < PYRAMID_STEP_PCT for x in PYRAMID_GRID_PHASES)
+    assert PYRAMID_GRID_COUNT == 1
+    assert PYRAMID_GRID_CAPITAL_SHARE == D(1)
     assert RANGE_TRIGGER_PCT > 0 and RANGE_TAKE_PROFIT_PCT > 0 and RANGE_HARD_STOP_PCT > 0
     assert RECOVERY_MULTIPLIER >= D(1) and MAX_RECOVERY_FAILURES >= 0
     assert configured_max_recovery_notional("BTCUSDT") >= configured_initial_notional("BTCUSDT")
@@ -3205,7 +3257,7 @@ def run_internal_regression_checks() -> None:
     assert RECOVERY_MULTIPLIER ** 2 == RECOVERY_MULTIPLIER * RECOVERY_MULTIPLIER
     assert PYRAMID_BANKROLL_USD > 0 and PYRAMID_INITIAL_NOTIONAL_USD > 0
     assert PYRAMID_BTC_MIN_ADD_NOTIONAL_USD > 0
-    assert PYRAMID_STEP_PCT > 0 and D(0) < PYRAMID_ADD_BANKROLL_PCT <= D(1)
+    assert PYRAMID_STEP_PCT > 0 and D(0) < PYRAMID_ADD_FREE_MARGIN_PCT <= D(1)
     assert PYRAMID_LEVERAGE >= 1 and PYRAMID_MAX_LOSS_USD > 0
 
     # V24 regression: realized PnL must clear RD exactly when it covers prior loss.
@@ -3215,7 +3267,8 @@ def run_internal_regression_checks() -> None:
     _t2 = {"equity":"10", "realized_pnl":"0", "recovery_deficit":"1", "wins":0, "losses":0}
     _apply_realized_pnl_to_state(_t2, D("0.75"), D("100"), "TEST_RECOVERY_PARTIAL")
     assert dec(_t2["recovery_deficit"]) == D("0.25")
-    logger.info("SELF TEST V27 | PASS | independent-pyramid-anchor/range-retire-selective/recovery-reset/risk/tick invariants")
+    assert D("100") * D("0.05") * D("10") == D("50")
+    logger.info("SELF TEST V28 | PASS | single-pyramid/real-free-margin/range-retire/recovery/risk/tick invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -3238,14 +3291,75 @@ class Bot:
         self.pyramid_engines: List[PyramidEngine] = []
         self.last_hb = 0.0
 
+    def _retire_empty_pyramid_grid(self, st: Dict[str, Any], reason: str) -> None:
+        st["anchor"] = None
+        st["next_level"] = max(1, int(st.get("next_level", 1)))
+        st["legs"] = []
+        st["stopped"] = True
+        st["stop_reason"] = reason
+        st["last_update"] = now_iso()
+
+    def _migrate_single_g0_to_legacy(self) -> None:
+        """Migra G0 para o PYRAMID original quando isso é inequívoco."""
+        maintenance = self.store.state.setdefault("maintenance", {"completed_emergency_actions": []})
+        report = maintenance.setdefault("pyramid_v28_migration", {})
+        grids = self.store.state.setdefault("pyramid_grids", {})
+
+        for sym in SYMBOLS:
+            for side in ("LONG", "SHORT"):
+                legacy_key = f"{sym}:{side}"
+                legacy = self.store.state["pyramid"].setdefault(legacy_key, empty_pyramid_state(sym, side))
+                gkey = f"{sym}:{side}:G0"
+                g0 = grids.get(gkey)
+                if not isinstance(g0, dict):
+                    report[legacy_key] = {"status": "NO_G0", "at": now_iso()}
+                    continue
+
+                legacy_legs = list(legacy.get("legs", []) or [])
+                g0_legs = list(g0.get("legs", []) or [])
+                old_id = str(g0.get("strategy") or f"PYRAMID:{sym}:{side}:G0")
+                new_id = f"PYRAMID:{sym}:{side}"
+
+                if g0_legs and not legacy_legs:
+                    promoted = dict(g0)
+                    promoted["strategy"] = new_id
+                    promoted["grid_id"] = "LEGACY"
+                    promoted["grid_phase"] = "0"
+                    promoted["capital_share"] = "1"
+                    promoted["bankroll"] = str(PYRAMID_BANKROLL_USD)
+                    promoted["equity"] = str(PYRAMID_BANKROLL_USD + dec(promoted.get("last_net_pnl")))
+                    promoted["last_update"] = now_iso()
+                    self.store.state["pyramid"][legacy_key] = promoted
+                    self.ledger.rename_strategy(old_id, new_id, sym, side)
+                    self._retire_empty_pyramid_grid(g0, "MIGRATED_TO_LEGACY_V28")
+                    g0["strategy"] = old_id
+                    report[legacy_key] = {"status": "G0_PROMOTED", "at": now_iso()}
+                    logger.warning(
+                        f"PYRAMID MIGRATION V28 | {sym} {side} | G0 -> LEGACY | "
+                        f"legs={len(g0_legs)} anchor={promoted.get('anchor')}"
+                    )
+                elif g0_legs and legacy_legs:
+                    report[legacy_key] = {"status": "DUAL_LIVE_G0_DRAIN_ONLY", "at": now_iso()}
+                    logger.warning(
+                        f"PYRAMID MIGRATION V28 | {sym} {side} | LEGACY+G0 ambos possuem legs | "
+                        f"LEGACY ativo, G0 DRAIN-ONLY; nenhuma nova entrada G0"
+                    )
+                else:
+                    self._retire_empty_pyramid_grid(g0, "RETIRED_EMPTY_G0_V28")
+                    report[legacy_key] = {"status": "G0_RETIRED_EMPTY", "at": now_iso()}
+
+        self.store.save()
+
     def startup(self) -> None:
         logger.info("=" * 90)
         logger.info(f"{BOT_NAME} | version={VERSION} | LIVE_TRADING={LIVE_TRADING}")
-        if PYRAMID_ENGINE_ENABLED and PYRAMID_GRID_COUNT > 1 and not ALLOW_MULTI_STRATEGY_SAME_SYMBOL:
-            raise RuntimeError("PYRAMID subgrids requerem ALLOW_MULTI_STRATEGY_SAME_SYMBOL=1 para coexistirem no mesmo ativo")
+        if PYRAMID_GRID_PHASES != (D("0"),):
+            raise RuntimeError(
+                f"V28 usa uma única escada PYRAMID por símbolo/lado; PYRAMID_GRID_PHASES deve ser somente 0, atual={PYRAMID_GRID_PHASES}"
+            )
         if len(set(PYRAMID_GRID_PHASES)) != len(PYRAMID_GRID_PHASES) or any(x < 0 or x >= PYRAMID_STEP_PCT for x in PYRAMID_GRID_PHASES):
             raise RuntimeError(f"PYRAMID_GRID_PHASES invalidas: {PYRAMID_GRID_PHASES}; use fases unicas entre 0 e PYRAMID_STEP_PCT")
-        logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False (legacy positions auto-close on startup) | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} independent_anchor_phases={PYRAMID_GRID_PHASES} | INDICADORES=NONE")
+        logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False (legacy positions auto-close on startup) | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} architecture=SINGLE_LONG_SHORT_PER_SYMBOL | INDICADORES=NONE")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
         logger.info(f"BASE ETH/HYPE: bankroll={INITIAL_BANKROLL_USD} notional={INITIAL_OPERATION_NOTIONAL_USD} | BASE BTC: bankroll={BTC_INITIAL_BANKROLL_USD} notional={BTC_INITIAL_OPERATION_NOTIONAL_USD} | RANGE_RECOVERY={RECOVERY_MULTIPLIER}x | MAX_FAIL={MAX_RECOVERY_FAILURES}")
         logger.info(f"EXITS | RANGE_TP={RANGE_TAKE_PROFIT_PCT} RANGE_STOP={RANGE_HARD_STOP_PCT} | PYRAMID_MAX_LOSS={PYRAMID_MAX_LOSS_USD}")
@@ -3253,7 +3367,7 @@ class Bot:
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
         logger.info(f"V15 HARDENING | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
         logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD}")
-        logger.info(f"PYRAMID V26 INDEPENDENT | phases={PYRAMID_GRID_PHASES} share={PYRAMID_GRID_CAPITAL_SHARE} | bankroll={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_cash_pct={PYRAMID_ADD_BANKROLL_PCT} leverage={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} | BTC_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} then=5pct_equity | 2 bots/symbol LONG+SHORT")
+        logger.info(f"PYRAMID V28 | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT} leverage={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} | BTC_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} | 2 bots/symbol LONG+SHORT")
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
@@ -3272,6 +3386,7 @@ class Bot:
         if LIVE_TRADING:
             self.account.ensure_modes()
             self.account.sync(force=True)
+            self._migrate_single_g0_to_legacy()
             if LEDGER_RECONCILE_ON_STARTUP:
                 self.ledger.bootstrap_from_state(self.store)
             if EMERGENCY_CLOSE_ALL_AND_RESET:
@@ -3300,37 +3415,44 @@ class Bot:
                     legacy["protect_anchor"] = None
                     legacy["failures"] = 0
                     legacy["recovery_deficit"] = "0"
-                    legacy["last_result"] = "RETIRED_V27"
+                    legacy["last_result"] = "RETIRED_V28"
                     legacy["last_update"] = now_iso()
                     self.store.save()
                     release_owner(self.store, s, eng.id)
-                    logger.warning(f"RANGE RETIRED V27 | {s} | sem basket aberto; anchor legado removido")
+                    logger.warning(f"RANGE RETIRED V28 | {s} | sem basket aberto; anchor legado removido")
             if LIVE_TRADING:
                 self.account.sync(force=True)
                 self.reconciler.reconcile()
         else:
-            logger.warning("RANGE RETIRE V27 DESATIVADO POR ENV | RETIRE_LEGACY_RANGE_ON_STARTUP=0")
+            logger.warning("RANGE RETIRE V28 DESATIVADO POR ENV | RETIRE_LEGACY_RANGE_ON_STARTUP=0")
         if PYRAMID_ENGINE_ENABLED:
             self.pyramid_engines = []
-            # Drain any legacy Pyramid state with live legs, but never add new legacy levels.
+            if not LIVE_TRADING:
+                self._migrate_single_g0_to_legacy()
+
+            # V28: uma única escada ativa por símbolo/lado: PYRAMID original.
             for s in SYMBOLS:
                 for side in ("LONG", "SHORT"):
                     legacy_key = f"{s}:{side}"
-                    legacy = self.store.state.get("pyramid", {}).get(legacy_key, {})
-                    if legacy.get("legs"):
-                        self.pyramid_engines.append(
-                            PyramidEngine(s, side, self.client, self.md, self.news, self.account, self.exe, self.store,
-                                          state_bucket="pyramid", state_key=legacy_key,
-                                          grid_id="LEGACY", grid_phase=D(0), allow_new_entries=False)
+                    self.pyramid_engines.append(
+                        PyramidEngine(
+                            s, side, self.client, self.md, self.news, self.account, self.exe, self.store,
+                            state_bucket="pyramid", state_key=legacy_key,
+                            grid_id="LEGACY", grid_phase=D(0), allow_new_entries=True,
                         )
-            for s in SYMBOLS:
-                for side in ("LONG", "SHORT"):
-                    for i, phase in enumerate(PYRAMID_GRID_PHASES):
-                        gid = f"G{i}"
+                    )
+
+                    # Compatibilidade: se V27 deixou G0 com legs simultâneas ao LEGACY,
+                    # G0 é gerenciado sem receber novas adições.
+                    gkey = f"{s}:{side}:G0"
+                    g0 = self.store.state.get("pyramid_grids", {}).get(gkey, {})
+                    if isinstance(g0, dict) and g0.get("legs"):
                         self.pyramid_engines.append(
-                            PyramidEngine(s, side, self.client, self.md, self.news, self.account, self.exe, self.store,
-                                          state_bucket="pyramid_grids", state_key=f"{s}:{side}:{gid}",
-                                          grid_id=gid, grid_phase=phase, allow_new_entries=True)
+                            PyramidEngine(
+                                s, side, self.client, self.md, self.news, self.account, self.exe, self.store,
+                                state_bucket="pyramid_grids", state_key=gkey,
+                                grid_id="G0", grid_phase=D(0), allow_new_entries=False,
+                            )
                         )
         self.md.start(); self.news.start()
 
@@ -3475,21 +3597,21 @@ class Bot:
                 d = e.diagnostic(mark)
                 if d.get("status") == "WAITING_TRIGGER":
                     logger.info(
-                        f"PYRAMID WAIT V21 | {e.id} | status={d['status']} reason={d['reason']} "
+                        f"PYRAMID WAIT V28 | {e.id} | status={d['status']} reason={d['reason']} "
                         f"mark={d['mark']} anchor={d['anchor']} next_level={d['level']} "
                         f"trigger={d['trigger']} faltam_pct={d['remaining_pct']:.6f}% "
                         f"next_notional_usd={d['desired_notional']} legs={d['legs']} eq={d['equity']} net={d['net']}"
                     )
                 elif d.get("status") == "TRIGGER_REACHED":
                     logger.warning(
-                        f"PYRAMID TRIGGER V21 | {e.id} | status={d['status']} reason={d['reason']} "
+                        f"PYRAMID TRIGGER V28 | {e.id} | status={d['status']} reason={d['reason']} "
                         f"mark={d['mark']} trigger={d['trigger']} next_level={d['level']} "
                         f"next_notional_usd={d['desired_notional']} legs={d['legs']}"
                     )
                 else:
-                    logger.info(f"PYRAMID STATUS V21 | {e.id} | {d}")
+                    logger.info(f"PYRAMID STATUS V28 | {e.id} | {d}")
             except Exception as ex:
-                logger.warning(f"PYRAMID DIAGNOSTIC FAIL V21 | {e.id} | {ex}")
+                logger.warning(f"PYRAMID DIAGNOSTIC FAIL V28 | {e.id} | {ex}")
         with self.news._lock:
             news_events = len(self.news.events)
             news_source = self.news.last_source
@@ -3504,7 +3626,7 @@ class Bot:
             f"mode=HEDGE margin=ISOLATED multi_strategy_same_symbol={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} native_protection={NATIVE_PROTECTIVE_ORDERS} | "
             f"news={news_health} source={news_source} events={news_events} age_s={news_age} fail_closed={NEWS_FAIL_CLOSED} window=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | "
             f"range=False legacy_range_engines={len(self.range_engines)} | "
-            f"pyramid={PYRAMID_ENGINE_ENABLED} bankroll={PYRAMID_BANKROLL_USD} initial={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_cash_pct={PYRAMID_ADD_BANKROLL_PCT} btc_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} lev={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD}"
+            f"pyramid={PYRAMID_ENGINE_ENABLED} architecture=SINGLE bankroll_logico={PYRAMID_BANKROLL_USD} initial={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT} btc_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} lev={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD}"
         )
         if LIVE_TRADING:
             try:
