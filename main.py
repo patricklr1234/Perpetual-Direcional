@@ -54,6 +54,7 @@ Segurança:
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import logging
 import math
@@ -96,7 +97,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "7.9.0-v31-identity-normalized"
+VERSION = "8.9.0-v41-canonical-production"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -110,11 +111,14 @@ EMERGENCY_RESET_ID = os.getenv("EMERGENCY_RESET_ID", "reset-20260830-01").strip(
 BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
 BOT_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = BOT_DIR / "state.json"
+STATE_BACKUP_FILE = BOT_DIR / "state.backup.json"
 TRADES_FILE = BOT_DIR / "trades.jsonl"
 NEWS_CACHE_FILE = BOT_DIR / "news_calendar_cache.json"
 LOG_FILE = BOT_DIR / "aster_bot.log"
 LEDGER_FILE = BOT_DIR / "fill_ledger.sqlite3"
 ORDER_JOURNAL_FILE = BOT_DIR / "order_journal.jsonl"
+INSTANCE_LOCK_FILE = BOT_DIR / f"{BOT_NAME.lower()}.instance.lock"
+RATE_LIMIT_STATE_FILE = BOT_DIR / "rate_limit_cooldown.json"
 
 SYMBOLS = tuple(s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,HYPEUSDT").split(",") if s.strip())
 if not SYMBOLS:
@@ -216,10 +220,68 @@ RECONCILE_INTERVAL_SECONDS = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "10")
 STATE_LEDGER_MISMATCH_CONFIRMATIONS = int(os.getenv("STATE_LEDGER_MISMATCH_CONFIRMATIONS", "2"))
 UNKNOWN_ORDER_QUERY_ATTEMPTS = int(os.getenv("UNKNOWN_ORDER_QUERY_ATTEMPTS", "12"))
 UNKNOWN_ORDER_QUERY_DELAY_SECONDS = float(os.getenv("UNKNOWN_ORDER_QUERY_DELAY_SECONDS", "0.5"))
+RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS", "60"))
+RATE_LIMIT_MAX_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_MAX_COOLDOWN_SECONDS", "3600"))
+CANCEL_CONFIRM_ATTEMPTS = int(os.getenv("CANCEL_CONFIRM_ATTEMPTS", "8"))
+CANCEL_CONFIRM_DELAY_SECONDS = float(os.getenv("CANCEL_CONFIRM_DELAY_SECONDS", "0.25"))
 LEDGER_RECONCILE_ON_STARTUP = os.getenv("LEDGER_RECONCILE_ON_STARTUP", "1") == "1"
 SELF_TEST_ON_STARTUP = os.getenv("SELF_TEST_ON_STARTUP", "1") == "1"
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+def validate_runtime_config() -> None:
+    """Fail fast on contradictory/unsafe environment configuration before network or trading."""
+    errors: List[str] = []
+
+    def require(cond: bool, message: str) -> None:
+        if not cond:
+            errors.append(message)
+
+    require(1 <= MIN_LEVERAGE <= MAX_REQUESTED_LEVERAGE <= BOT_HARD_MAX_LEVERAGE <= API_HARD_MAX_LEVERAGE,
+            f"leverage global invalida: MIN={MIN_LEVERAGE} requested={MAX_REQUESTED_LEVERAGE} bot_cap={BOT_HARD_MAX_LEVERAGE} api_cap={API_HARD_MAX_LEVERAGE}")
+    require(1 <= PYRAMID_LEVERAGE <= BOT_HARD_MAX_LEVERAGE,
+            f"PYRAMID_LEVERAGE invalida: target={PYRAMID_LEVERAGE} bot_cap={BOT_HARD_MAX_LEVERAGE}")
+    require(PYRAMID_MAX_EFFECTIVE_LEVERAGE == PYRAMID_LEVERAGE,
+            f"PYRAMID_MAX_EFFECTIVE_LEVERAGE deve ser igual ao target para esta arquitetura: target={PYRAMID_LEVERAGE} cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE}")
+    require(D(0) < LEVERAGE_HEADROOM <= D(1), f"LEVERAGE_HEADROOM deve estar em (0,1], atual={LEVERAGE_HEADROOM}")
+    require(D(0) <= LIQUIDATION_BUFFER_PCT < D(1), f"LIQUIDATION_BUFFER_PCT invalido: {LIQUIDATION_BUFFER_PCT}")
+    require(ADVERSE_MOVE_SAFETY_MULTIPLIER >= D(1), f"ADVERSE_MOVE_SAFETY_MULTIPLIER deve ser >=1, atual={ADVERSE_MOVE_SAFETY_MULTIPLIER}")
+    require(MIN_FREE_WALLET_BUFFER_USD >= D(0), f"MIN_FREE_WALLET_BUFFER_USD nao pode ser negativo: {MIN_FREE_WALLET_BUFFER_USD}")
+    require(D(0) < MAX_MARGIN_FRACTION_PER_STRATEGY <= D(1), f"MAX_MARGIN_FRACTION_PER_STRATEGY deve estar em (0,1], atual={MAX_MARGIN_FRACTION_PER_STRATEGY}")
+
+    for name, value in (("PYRAMID_BANKROLL_USD", PYRAMID_BANKROLL_USD), ("PYRAMID_INITIAL_NOTIONAL_USD", PYRAMID_INITIAL_NOTIONAL_USD),
+                        ("PYRAMID_MAX_LOSS_USD", PYRAMID_MAX_LOSS_USD), ("PYRAMID_BTC_MIN_ADD_NOTIONAL_USD", PYRAMID_BTC_MIN_ADD_NOTIONAL_USD),
+                        ("MAX_RECOVERY_NOTIONAL_USD", MAX_RECOVERY_NOTIONAL_USD), ("BTC_MAX_RECOVERY_NOTIONAL_USD", BTC_MAX_RECOVERY_NOTIONAL_USD),
+                        ("MAX_TOTAL_SYMBOL_NOTIONAL_USD", MAX_TOTAL_SYMBOL_NOTIONAL_USD), ("BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD", BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD)):
+        require(value > 0, f"{name} deve ser >0, atual={value}")
+
+    require(D(0) < PYRAMID_STEP_PCT < D(1), f"PYRAMID_STEP_PCT deve estar em (0,1), atual={PYRAMID_STEP_PCT}")
+    require(D(0) < PYRAMID_ADD_FREE_MARGIN_PCT <= D(1), f"PYRAMID_ADD_FREE_MARGIN_PCT deve estar em (0,1], atual={PYRAMID_ADD_FREE_MARGIN_PCT}")
+    require(PYRAMID_MAX_LEVELS_PER_TICK >= 1, f"PYRAMID_MAX_LEVELS_PER_TICK deve ser >=1, atual={PYRAMID_MAX_LEVELS_PER_TICK}")
+    require(PYRAMID_NATIVE_STOP_REFRESH_SECONDS > 0, f"PYRAMID_NATIVE_STOP_REFRESH_SECONDS deve ser >0, atual={PYRAMID_NATIVE_STOP_REFRESH_SECONDS}")
+    require(PYRAMID_GRID_PHASES == (D("0"),), f"PYRAMID_GRID_PHASES deve ser somente (0,), atual={PYRAMID_GRID_PHASES}")
+    require(MAX_TOTAL_SYMBOL_NOTIONAL_USD >= PYRAMID_INITIAL_NOTIONAL_USD, "MAX_TOTAL_SYMBOL_NOTIONAL_USD menor que PYRAMID_INITIAL_NOTIONAL_USD")
+    require(BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD >= PYRAMID_INITIAL_NOTIONAL_USD, "BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD menor que PYRAMID_INITIAL_NOTIONAL_USD")
+    require(PROTECTIVE_WORKING_TYPE in ("MARK_PRICE", "CONTRACT_PRICE"), f"PROTECTIVE_WORKING_TYPE invalido: {PROTECTIVE_WORKING_TYPE}")
+
+    for name, value in (("HTTP_TIMEOUT", HTTP_TIMEOUT), ("ORDER_FILL_WAIT_SECONDS", ORDER_FILL_WAIT_SECONDS), ("ORDER_POLL_SECONDS", ORDER_POLL_SECONDS),
+                        ("MAIN_LOOP_SECONDS", MAIN_LOOP_SECONDS), ("REST_PRICE_FALLBACK_SECONDS", REST_PRICE_FALLBACK_SECONDS), ("HEARTBEAT_SECONDS", HEARTBEAT_SECONDS),
+                        ("ACCOUNT_SYNC_SECONDS", ACCOUNT_SYNC_SECONDS), ("PROTECTIVE_WATCHDOG_SECONDS", PROTECTIVE_WATCHDOG_SECONDS),
+                        ("MAX_PRICE_AGE_FOR_ENTRY_SECONDS", MAX_PRICE_AGE_FOR_ENTRY_SECONDS), ("RECONCILE_INTERVAL_SECONDS", RECONCILE_INTERVAL_SECONDS),
+                        ("UNKNOWN_ORDER_QUERY_DELAY_SECONDS", UNKNOWN_ORDER_QUERY_DELAY_SECONDS)):
+        require(value > 0, f"{name} deve ser >0, atual={value}")
+    require(RECV_WINDOW > 0, f"RECV_WINDOW deve ser >0, atual={RECV_WINDOW}")
+    require(STATE_LEDGER_MISMATCH_CONFIRMATIONS >= 1, f"STATE_LEDGER_MISMATCH_CONFIRMATIONS deve ser >=1, atual={STATE_LEDGER_MISMATCH_CONFIRMATIONS}")
+    require(UNKNOWN_ORDER_QUERY_ATTEMPTS >= 1, f"UNKNOWN_ORDER_QUERY_ATTEMPTS deve ser >=1, atual={UNKNOWN_ORDER_QUERY_ATTEMPTS}")
+    require(RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS > 0, f"RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS deve ser >0, atual={RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS}")
+    require(RATE_LIMIT_MAX_COOLDOWN_SECONDS >= RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS,
+            f"RATE_LIMIT_MAX_COOLDOWN_SECONDS deve ser >= default, atual={RATE_LIMIT_MAX_COOLDOWN_SECONDS}")
+    require(CANCEL_CONFIRM_ATTEMPTS >= 1, f"CANCEL_CONFIRM_ATTEMPTS deve ser >=1, atual={CANCEL_CONFIRM_ATTEMPTS}")
+    require(CANCEL_CONFIRM_DELAY_SECONDS > 0, f"CANCEL_CONFIRM_DELAY_SECONDS deve ser >0, atual={CANCEL_CONFIRM_DELAY_SECONDS}")
+    require(NEWS_WINDOW_BEFORE_MIN >= 0 and NEWS_WINDOW_AFTER_MIN >= 0 and NEWS_REFRESH_SECONDS > 0 and NEWS_MAX_STALE_SECONDS > 0 and NEWS_LOOKAHEAD_DAYS >= 1, "configuracao NEWS invalida")
+
+    if errors:
+        raise RuntimeError("CONFIG INVALIDA | " + " | ".join(errors))
 
 # -----------------------------------------------------------------------------
 # LOGGING
@@ -259,14 +321,40 @@ def dstr(x: Decimal, places: int = 8) -> str:
     s = format(x.quantize(q), "f")
     return s.rstrip("0").rstrip(".") if "." in s else s
 
-def atomic_json_write(path: Path, data: Dict[str, Any]) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+_JSONL_LOCK = threading.RLock()
 
-def jsonl_append(path: Path, obj: Dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+def atomic_json_write(path: Path, data: Dict[str, Any]) -> None:
+    """Durable atomic JSON write: fsync temp, replace, then fsync directory."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception:
+        # Directory fsync is not available on every platform/filesystem.
+        pass
+
+def jsonl_append(path: Path, obj: Dict[str, Any]) -> bool:
+    """Best-effort auxiliary audit log. Never changes order semantics after an exchange fill."""
+    try:
+        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        with _JSONL_LOCK:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+        return True
+    except Exception as e:
+        logger.critical("JSONL AUDIT WRITE FAIL | %s | %s", path, e)
+        return False
 
 def floor_step(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
@@ -318,9 +406,27 @@ class AsterClient:
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": f"{BOT_NAME}/{VERSION}"})
         self.time_offset_ms = 0
+        # Only authenticated/account/trading calls participate in this streak. Public market-data
+        # success must not erase a degraded authenticated API signal.
         self.api_error_streak = 0
         self._lock = threading.Lock()
         self._last_nonce = 0
+        self._rate_limit_lock = threading.RLock()
+        self._rate_limit_until = 0.0
+        try:
+            if RATE_LIMIT_STATE_FILE.exists():
+                saved = json.loads(RATE_LIMIT_STATE_FILE.read_text(encoding="utf-8"))
+                saved_until = float(saved.get("until_epoch", 0)) if isinstance(saved, dict) else 0.0
+                if saved_until > time.time():
+                    self._rate_limit_until = saved_until
+                    logger.warning("RATE LIMIT COOLDOWN RESTORED | remaining=%.1fs", saved_until - time.time())
+                else:
+                    try:
+                        RATE_LIMIT_STATE_FILE.unlink()
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning("RATE LIMIT STATE INVALID | ignorando arquivo %s | %s", RATE_LIMIT_STATE_FILE, e)
 
     def _ts(self) -> int:
         return now_ms() + self.time_offset_ms
@@ -354,8 +460,39 @@ class AsterClient:
             signable = encode_typed_data(full_message=typed_data)
             params["signature"] = Account.sign_message(signable, private_key=self.signer_private_key).signature.hex()
         url = BASE_URL + path
+        with self._rate_limit_lock:
+            cooldown_left = self._rate_limit_until - time.time()
+        if cooldown_left > 0:
+            if signed:
+                self.api_error_streak += 1
+            raise AsterAPIError(
+                f"RATE LIMIT COOLDOWN ativo por mais {cooldown_left:.1f}s",
+                429,
+                {"cooldown_seconds": cooldown_left},
+            )
         try:
             r = self.s.request(method, url, params=params, timeout=HTTP_TIMEOUT)
+            if r.status_code in (418, 429):
+                try:
+                    retry_after = float(r.headers.get("Retry-After") or RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS)
+                except Exception:
+                    retry_after = RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
+                retry_after = max(1.0, min(retry_after, RATE_LIMIT_MAX_COOLDOWN_SECONDS))
+                with self._rate_limit_lock:
+                    self._rate_limit_until = max(self._rate_limit_until, time.time() + retry_after)
+                    try:
+                        atomic_json_write(RATE_LIMIT_STATE_FILE, {
+                            "until_epoch": self._rate_limit_until,
+                            "http_status": r.status_code,
+                            "at": now_iso(),
+                        })
+                    except Exception as persist_error:
+                        logger.critical("RATE LIMIT COOLDOWN PERSIST FAIL | %s", persist_error)
+                raise AsterAPIError(
+                    f"HTTP {r.status_code} RATE LIMIT | cooldown={retry_after}s",
+                    r.status_code,
+                    r.text,
+                )
             if r.status_code == 503 and not retry_unknown:
                 raise AsterAPIError("HTTP 503: status de execucao desconhecido; reconciliar por clientOrderId", 503, r.text)
             if r.status_code >= 400:
@@ -365,14 +502,21 @@ class AsterClient:
                     msg = body.get("msg", r.text) if isinstance(body, dict) else r.text
                 except Exception:
                     code, msg, body = None, r.text, r.text
+                # Aster documents -1006 and -1007 as execution status UNKNOWN. For order POST,
+                # route them through the same idempotent query-by-clientOrderId flow as HTTP 503.
+                if method.upper() == "POST" and path == "/fapi/v3/order" and code in (-1006, -1007):
+                    raise AsterAPIError(f"ORDER EXECUTION UNKNOWN | code={code} | {msg}", 503, body)
                 raise AsterAPIError(f"HTTP {r.status_code} | {msg}", code, body)
-            self.api_error_streak = 0
+            if signed:
+                self.api_error_streak = 0
             return r.json() if r.text else {}
         except AsterAPIError:
-            self.api_error_streak += 1
+            if signed:
+                self.api_error_streak += 1
             raise
         except (requests.Timeout, requests.ConnectionError) as e:
-            self.api_error_streak += 1
+            if signed:
+                self.api_error_streak += 1
             if method.upper() == "POST" and path == "/fapi/v3/order":
                 raise AsterAPIError(
                     f"TRANSPORT UNKNOWN EXECUTION | {type(e).__name__}: {e}",
@@ -381,7 +525,8 @@ class AsterClient:
                 ) from e
             raise AsterAPIError(str(e)) from e
         except Exception as e:
-            self.api_error_streak += 1
+            if signed:
+                self.api_error_streak += 1
             raise AsterAPIError(str(e)) from e
 
     def exchange_info(self) -> Dict[str, Any]:
@@ -1059,6 +1204,7 @@ def fresh_state() -> Dict[str, Any]:
         "updated_at": now_iso(),
         "kill_switch": {"mode": "OFF", "reason": None, "at": None},
         "trade_gate": {"open_allowed": True, "reason": None, "at": now_iso()},
+        "operational_blocks": {},
         "protection_blocks": {},
         "range": {s: empty_range_state(s) for s in SYMBOLS},
         "pyramid": {f"{s}:{side}": empty_pyramid_state(s, side) for s in SYMBOLS for side in ("LONG", "SHORT")},
@@ -1069,20 +1215,106 @@ def fresh_state() -> Dict[str, Any]:
         "maintenance": {"completed_emergency_actions": []},
     }
 
+def acquire_instance_lock():
+    """Acquire a non-blocking process lock for this robot/BOT_DIR.
+
+    The descriptor is intentionally kept open for the process lifetime; POSIX releases
+    flock automatically on process exit/crash. A second live instance fails closed before
+    it can read state or submit orders.
+    """
+    fh = open(INSTANCE_LOCK_FILE, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as e:
+        try:
+            fh.seek(0)
+            owner = fh.read().strip()
+        except Exception:
+            owner = ""
+        fh.close()
+        raise RuntimeError(
+            f"OUTRA INSTANCIA ATIVA | lock={INSTANCE_LOCK_FILE} | owner={owner or 'desconhecido'}"
+        ) from e
+    fh.seek(0)
+    fh.truncate(0)
+    fh.write(f"pid={os.getpid()} bot={BOT_NAME} version={VERSION} started={now_iso()}\n")
+    fh.flush()
+    os.fsync(fh.fileno())
+    return fh
+
 class StateStore:
     def __init__(self):
         self.lock = threading.RLock()
+        self.loaded_fresh = False
+        self.recovered_from_backup = False
         self.state = self._load()
 
+    @staticmethod
+    def _validate_state_shape(st: Any) -> Dict[str, Any]:
+        if not isinstance(st, dict):
+            raise ValueError("state root precisa ser objeto JSON")
+        required_maps = ("kill_switch", "trade_gate", "operational_blocks", "protection_blocks",
+                         "symbol_owner", "last_wallet", "maintenance", "range", "macd", "pyramid", "pyramid_grids")
+        for key in required_maps:
+            if key in st and not isinstance(st.get(key), dict):
+                raise ValueError(f"state[{key!r}] precisa ser objeto JSON")
+        if "range_grids" in st and not isinstance(st.get("range_grids"), dict):
+            raise ValueError("state['range_grids'] precisa ser objeto JSON")
+        gate = st.get("trade_gate")
+        if isinstance(gate, dict) and "open_allowed" in gate and not isinstance(gate.get("open_allowed"), bool):
+            raise ValueError("state['trade_gate']['open_allowed'] precisa ser boolean")
+        ks = st.get("kill_switch")
+        if isinstance(ks, dict) and "mode" in ks and str(ks.get("mode")) not in ("OFF", "SOFT", "HARD"):
+            raise ValueError("state['kill_switch']['mode'] invalido")
+        return st
+
+    @classmethod
+    def _read_state_file(cls, path: Path) -> Dict[str, Any]:
+        raw = path.read_text(encoding="utf-8")
+        return cls._validate_state_shape(json.loads(raw))
+
     def _load(self) -> Dict[str, Any]:
-        try:
-            st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            logger.info(f"STATE | carregado | {STATE_FILE}")
-        except Exception:
-            st = fresh_state()
-            logger.info("STATE | novo")
+        if not STATE_FILE.exists():
+            if STATE_BACKUP_FILE.exists():
+                try:
+                    st = self._read_state_file(STATE_BACKUP_FILE)
+                    self.recovered_from_backup = True
+                    logger.critical("STATE RECOVERY | principal ausente; backup valido carregado | %s", STATE_BACKUP_FILE)
+                    atomic_json_write(STATE_FILE, st)
+                except Exception as backup_error:
+                    raise RuntimeError(
+                        f"STATE AUSENTE e backup invalido ({backup_error}). Startup interrompido."
+                    ) from backup_error
+            else:
+                st = fresh_state()
+                self.loaded_fresh = True
+                logger.info("STATE | novo | principal e backup inexistentes")
+        else:
+            try:
+                st = self._read_state_file(STATE_FILE)
+                logger.info(f"STATE | carregado | {STATE_FILE}")
+            except Exception as primary_error:
+                logger.critical("STATE PRIMARY INVALID | %s | erro=%s", STATE_FILE, primary_error)
+                if STATE_BACKUP_FILE.exists():
+                    try:
+                        st = self._read_state_file(STATE_BACKUP_FILE)
+                        self.recovered_from_backup = True
+                        logger.critical("STATE RECOVERY | backup valido carregado | %s", STATE_BACKUP_FILE)
+                        atomic_json_write(STATE_FILE, st)
+                        logger.critical("STATE RECOVERY | state.json restaurado atomicamente a partir do backup")
+                    except Exception as backup_error:
+                        raise RuntimeError(
+                            f"STATE CORROMPIDO: principal invalido ({primary_error}) e backup invalido ({backup_error}). "
+                            "Startup interrompido para nao perder ownership/posicoes persistidas."
+                        ) from backup_error
+                else:
+                    raise RuntimeError(
+                        f"STATE CORROMPIDO: {STATE_FILE} existe mas e invalido ({primary_error}) e nao ha backup valido. "
+                        "Startup interrompido para nao substituir estado operacional por fresh_state()."
+                    ) from primary_error
         st.setdefault("kill_switch", {"mode": "OFF", "reason": None, "at": None})
         st.setdefault("trade_gate", {"open_allowed": True, "reason": None, "at": now_iso()})
+        st.setdefault("operational_blocks", {})
         st.setdefault("protection_blocks", {})
         st.setdefault("range", {})
         st.setdefault("pyramid", {})
@@ -1104,6 +1336,14 @@ class StateStore:
     def save(self) -> None:
         with self.lock:
             self.state["updated_at"] = now_iso()
+            # Mantem uma geracao anterior valida antes de substituir o estado principal.
+            # Um arquivo existente so vira backup se puder ser parseado e validado.
+            if STATE_FILE.exists():
+                try:
+                    previous = self._read_state_file(STATE_FILE)
+                    atomic_json_write(STATE_BACKUP_FILE, previous)
+                except Exception as e:
+                    logger.error("STATE BACKUP SKIPPED | state atual invalido | %s", e)
             atomic_json_write(STATE_FILE, self.state)
 
     def kill(self, mode: str, reason: str) -> None:
@@ -1123,12 +1363,26 @@ class StateStore:
 
     def entry_allowed(self) -> Tuple[bool, Optional[str]]:
         with self.lock:
+            operational = self.state.get("operational_blocks", {}) or {}
+            if operational:
+                first_key = sorted(operational)[0]
+                return False, f"OPERATIONAL_BLOCK:{first_key}:{operational[first_key]}"
             blocks = self.state.get("protection_blocks", {}) or {}
             if blocks:
                 first_key = sorted(blocks)[0]
                 return False, f"PROTECTION_BLOCK:{first_key}:{blocks[first_key]}"
             g = self.state.get("trade_gate", {}) or {}
             return bool(g.get("open_allowed", True)), g.get("reason")
+
+    def set_operational_block(self, block_id: str, reason: Optional[str]) -> None:
+        with self.lock:
+            blocks = self.state.setdefault("operational_blocks", {})
+            if reason:
+                blocks[str(block_id)] = str(reason)
+            else:
+                blocks.pop(str(block_id), None)
+            self.save()
+        logger.warning("OPERATIONAL BLOCK | id=%s | active=%s | reason=%s", block_id, bool(reason), reason)
 
     def set_protection_block(self, strategy_id: str, reason: Optional[str]) -> None:
         with self.lock:
@@ -1170,6 +1424,9 @@ class FillLedger:
         self.db = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
+        check = self.db.execute("PRAGMA quick_check").fetchone()
+        if not check or str(check[0]).lower() != "ok":
+            raise RuntimeError(f"LEDGER SQLITE CORROMPIDO | quick_check={check}")
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS orders (
             client_id TEXT PRIMARY KEY,
@@ -1279,6 +1536,20 @@ class FillLedger:
             row = self.db.execute("SELECT COALESCE(SUM(CAST(open_qty AS REAL)),0) FROM lots WHERE strategy_id=? AND symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0",
                                   (strategy_id, symbol, side)).fetchone()
         return dec(row[0] if row else 0)
+
+    def open_lots_by_strategy_prefix(self, prefix: str) -> List[Dict[str, Any]]:
+        """Return durable open lots owned by strategies whose id starts with prefix."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT leg_id,strategy_id,symbol,position_side,open_qty,entry_price,source "
+                "FROM lots WHERE strategy_id LIKE ? AND CAST(open_qty AS REAL)>0 ORDER BY opened_ms,leg_id",
+                (f"{prefix}%",),
+            ).fetchall()
+        return [
+            {"id": str(leg_id), "strategy_id": str(strategy_id), "symbol": str(symbol).upper(),
+             "side": str(side).upper(), "qty": str(qty), "entry_price": str(entry_price), "source": str(source)}
+            for leg_id, strategy_id, symbol, side, qty, entry_price, source in rows
+        ]
 
     def zero_open_strategy_side(self, strategy_id: str, symbol: str, side: str, reason: str = "AUTO_REPAIR") -> Decimal:
         """Zera apenas lots virtuais de uma estratégia/lado confirmados como fantasmas.
@@ -1479,8 +1750,8 @@ class AccountManager:
                 }
             self.store.save()
 
-    def free_margin(self) -> Decimal:
-        self.sync()
+    def free_margin(self, force: bool = False) -> Decimal:
+        self.sync(force=force)
         return max(D(0), self.available_balance - MIN_FREE_WALLET_BUFFER_USD)
 
     def ensure_modes(self) -> None:
@@ -1588,7 +1859,7 @@ class AccountManager:
                 f"BANKROLL MIGRATION | {strategy_state.get('strategy', symbol)} | base {previous_base}->{configured_base} | equity {previous_equity}->{strategy_state['equity']}"
             )
         logical_eq = dec(strategy_state.get("equity"), str(INITIAL_BANKROLL_USD))
-        physical_free = self.free_margin()
+        physical_free = self.free_margin(force=True)
         if logical_eq <= 0 or physical_free <= 0:
             return None
 
@@ -1794,12 +2065,22 @@ class ExecutionEngine:
         self.ledger = ledger
         self.orders = OrderManager(client, ledger)
         self.seq = 0
+        # 48 random bits per process boot materially reduce cross-restart collision risk.
+        # The 32-bit monotonic sequence never wraps silently; exhaustion fails closed.
+        self.boot_id = uuid.uuid4().hex[:12]
         self.lock = threading.RLock()
 
     def client_id(self, strategy_id: str, action: str) -> str:
-        self.seq = (self.seq + 1) % 9999
+        with self.lock:
+            if self.seq >= 0xFFFFFFFF:
+                raise RuntimeError("clientOrderId sequence exhausted for this process; restart required")
+            self.seq += 1
+            seq = self.seq
         digest = hashlib.sha1(strategy_id.encode()).hexdigest()[:6]
-        return f"{self.PREFIX}-{digest}-{action[:5]}-{int(time.time())%1000000}-{self.seq}"[:36]
+        cid = f"{self.PREFIX}-{self.boot_id}-{digest}-{action[:4]}-{seq:08x}"
+        if len(cid) > 36:
+            raise RuntimeError(f"clientOrderId interno excedeu 36 caracteres: {cid}")
+        return cid
 
     @staticmethod
     def order_side(position_side: str, opening: bool) -> str:
@@ -1808,25 +2089,42 @@ class ExecutionEngine:
         return "SELL" if opening else "BUY"
 
     def _fill_from_response(self, symbol: str, resp: Dict[str, Any], client_id: str,
-                            fallback_price: Decimal) -> Tuple[Decimal, Decimal]:
-        status = str(resp.get("status", ""))
+                            fallback_price: Decimal, requested_qty: Decimal) -> Tuple[Decimal, Decimal]:
+        status = str(resp.get("status", "")).upper()
         qty = dec(resp.get("executedQty"))
         avg = dec(resp.get("avgPrice"))
         end = time.time() + ORDER_FILL_WAIT_SECONDS
-        while (status not in ("FILLED", "PARTIALLY_FILLED") or qty <= 0 or avg <= 0) and time.time() < end:
+        terminal = {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
+        last_query_error: Optional[str] = None
+        while time.time() < end:
+            if status == "FILLED" and qty > 0:
+                break
+            if status in terminal and status != "FILLED":
+                break
             try:
                 q = self.client.query_order(symbol, client_id)
-                status = str(q.get("status", status))
+                status = str(q.get("status", status)).upper()
                 qty = dec(q.get("executedQty") or qty)
                 avg = dec(q.get("avgPrice") or avg)
                 resp = q
-                if status == "FILLED" and qty > 0 and avg > 0:
-                    break
-            except Exception:
-                pass
+                last_query_error = None
+            except Exception as e:
+                last_query_error = f"{type(e).__name__}:{e}"
+            if status == "FILLED" and qty > 0:
+                break
             time.sleep(ORDER_POLL_SECONDS)
         if qty <= 0:
-            raise RuntimeError(f"Ordem sem fill confirmado: {symbol} client_id={client_id} status={status}")
+            raise RuntimeError(
+                f"Ordem sem fill confirmado: {symbol} client_id={client_id} status={status} query_error={last_query_error}"
+            )
+        # Never let a known partial market fill masquerade as a completed logical open/close.
+        # Keeping state/ledger exposure unchanged forces reconciliation instead of orphaning residual quantity.
+        step = self.rules.rules[symbol].step_size if self.rules and symbol in self.rules.rules else D("0.00000001")
+        if qty + step < requested_qty or status != "FILLED":
+            raise RuntimeError(
+                f"MARKET PARTIAL/UNRESOLVED | {symbol} cid={client_id} status={status} "
+                f"filled={qty} requested={requested_qty} query_error={last_query_error}"
+            )
         if avg <= 0:
             avg = fallback_price
             logger.warning(f"FILL AVG AUSENTE | {symbol} | cid={client_id} | usando ref_price={fallback_price}")
@@ -1858,7 +2156,7 @@ class ExecutionEngine:
             submitted_ms = now_ms()
             resp = self.orders.submit_market(strategy_id, symbol, position_side, side, qty, cid,
                                              "OPEN" if opening else "CLOSE")
-            filled, avg = self._fill_from_response(symbol, resp, cid, ref_price)
+            filled, avg = self._fill_from_response(symbol, resp, cid, ref_price, qty)
             order_id = resp.get("orderId")
             if not order_id:
                 try:
@@ -1871,12 +2169,23 @@ class ExecutionEngine:
                                     "FILLED", order_id, filled, avg, commission, realized,
                                     "MARKET_EXECUTION")
             logger.info(f"ORDER FILLED | {strategy_id} | {'OPEN' if opening else 'CLOSE'} {side} posSide={position_side} requested_qty={qty} filled_qty={filled} avg={avg} commission={commission} realized={realized} cid={cid}")
+            if opening:
+                try:
+                    self.account.sync(force=True)
+                except Exception as e:
+                    logger.warning("POST-FILL ACCOUNT REFRESH FAIL | %s | cid=%s | %s", strategy_id, cid, e)
             return {"qty": filled, "price": avg, "client_id": cid, "order_id": order_id,
                     "status": "FILLED", "time": submitted_ms, "price_source": "EXCHANGE_AVG",
                     "commission_actual": commission, "realized_pnl_exchange": realized}
 
     def open_leg(self, strategy_id: str, symbol: str, position_side: str, sizing: Dict[str, Any],
                  reason: str) -> Optional[Dict[str, Any]]:
+        with self.client._rate_limit_lock:
+            _cooldown = max(0.0, self.client._rate_limit_until - time.time())
+        if _cooldown > 0:
+            logger.warning("OPEN BLOCK RATE LIMIT | %s | %s %s | cooldown_remaining=%.1fs",
+                           strategy_id, symbol, position_side, _cooldown)
+            return None
         requested_leverage = int(sizing["leverage"])
         effective_leverage = self.account.prepare_leverage_for_open(symbol, requested_leverage)
         if effective_leverage is None:
@@ -1893,7 +2202,7 @@ class ExecutionEngine:
         if actual_notional <= 0:
             actual_notional = dec(sizing["qty"]) * dec(sizing["price"])
         effective_margin = actual_notional / D(effective_leverage)
-        free_margin = self.account.free_margin()
+        free_margin = self.account.free_margin(force=True)
         if effective_margin > free_margin:
             logger.warning(
                 f"OPEN BLOCK MARGIN | {strategy_id} | {symbol} | notional={actual_notional} "
@@ -2063,10 +2372,38 @@ class ExecutionEngine:
             )
         except Exception:
             try:
-                self.client.cancel_order(symbol, tp_cid)
-            except Exception:
-                pass
+                self.cancel_and_confirm_terminal(symbol, tp_cid)
+            except Exception as rollback_error:
+                self.store.set_protection_block(strategy_id, f"BRACKET_INSTALL_ROLLBACK_UNCONFIRMED:{rollback_error}")
+                logger.critical("BRACKET INSTALL ROLLBACK INCOMPLETO | %s | %s", strategy_id, rollback_error)
             raise
+        # POST success alone is not proof of durable protection. Confirm both orders live/accepted.
+        # Any confirmation failure triggers a confirmed rollback of BOTH siblings before the
+        # caller is allowed to market-close the newly opened exposure.
+        confirmation_error: Optional[Exception] = None
+        try:
+            for _cid in (tp_cid, sl_cid):
+                _q = self.client.query_order(symbol, _cid)
+                if str(_q.get("status") or "").upper() not in ("NEW", "PARTIALLY_FILLED", "FILLED"):
+                    raise RuntimeError(
+                        f"PROTECAO NATIVA NAO CONFIRMADA | {symbol} | cid={_cid} | status={_q.get('status')}"
+                    )
+        except Exception as exc:
+            confirmation_error = exc
+        if confirmation_error is not None:
+            rollback_failures = []
+            for _cid in (tp_cid, sl_cid):
+                try:
+                    self.cancel_and_confirm_terminal(symbol, _cid)
+                except Exception as rollback_error:
+                    rollback_failures.append((_cid, str(rollback_error)))
+            if rollback_failures:
+                reason = f"BRACKET_CONFIRM_ROLLBACK_UNCERTAIN:{rollback_failures}"
+                self.store.set_protection_block(strategy_id, reason)
+                raise RuntimeError(
+                    f"{confirmation_error}; rollback de bracket nao confirmado: {rollback_failures}"
+                ) from confirmation_error
+            raise RuntimeError(str(confirmation_error)) from confirmation_error
         bracket = {
             "tp": {"client_id": tp_cid, "order_id": tp_resp.get("orderId"), "stop_price": str(tp),
                    "type": "TAKE_PROFIT_MARKET", "status": tp_resp.get("status", "NEW")},
@@ -2079,24 +2416,51 @@ class ExecutionEngine:
         return bracket
 
 
+    def cancel_and_confirm_terminal(self, symbol: str, client_id: str) -> Dict[str, Any]:
+        """Cancel a conditional order and prove a terminal state before relying on the cancellation."""
+        if not client_id or not LIVE_TRADING:
+            return {"status": "CANCELED", "clientOrderId": client_id}
+        try:
+            self.client.cancel_order(symbol, client_id)
+        except AsterAPIError as e:
+            if e.code not in (-2011, -2013):
+                raise
+        terminal = {"CANCELED", "EXPIRED", "FILLED", "REJECTED", "MISSING", "UNKNOWN_OR_GONE"}
+        last: Dict[str, Any] = {}
+        for _ in range(max(1, CANCEL_CONFIRM_ATTEMPTS)):
+            try:
+                last = self.client.query_order(symbol, client_id) or {}
+                if str(last.get("status") or "").upper() in terminal:
+                    return last
+            except AsterAPIError as e:
+                if e.code in (-2011, -2013):
+                    return {"status": "MISSING", "clientOrderId": client_id}
+                last = {"status": "UNKNOWN", "error": str(e), "clientOrderId": client_id}
+            time.sleep(max(0.05, CANCEL_CONFIRM_DELAY_SECONDS))
+        raise RuntimeError(f"CANCEL NAO CONFIRMADO | {symbol} | cid={client_id} | last={last}")
+
     def cancel_bracket(self, symbol: str, bracket: Optional[Dict[str, Any]]) -> None:
         if not bracket or not LIVE_TRADING:
             return
+        failures = []
         for key in ("tp", "sl"):
             cid = str((bracket.get(key) or {}).get("client_id") or "")
             if not cid:
                 continue
             try:
-                self.client.cancel_order(symbol, cid)
+                self.cancel_and_confirm_terminal(symbol, cid)
             except Exception as e:
+                failures.append((cid, str(e)))
                 logger.warning(f"CANCEL PROTECTION FAIL | {symbol} | {cid} | {e}")
+        if failures:
+            raise RuntimeError(f"Protecao nao teve cancelamento confirmado: {failures}")
 
     def consume_bracket_fill(self, strategy_id: str, symbol: str, leg: Dict[str, Any],
                              bracket: Optional[Dict[str, Any]], ref_price: Decimal) -> Optional[Dict[str, Any]]:
         if not LIVE_TRADING or not bracket:
             return None
-        triggered_key = None
-        triggered = None
+        snapshots: Dict[str, Dict[str, Any]] = {}
+        first_triggered_key: Optional[str] = None
         for key in ("tp", "sl"):
             meta = bracket.get(key) or {}
             cid = str(meta.get("client_id") or "")
@@ -2106,46 +2470,74 @@ class ExecutionEngine:
                 q = self.client.query_order(symbol, cid)
             except AsterAPIError as e:
                 if e.code in (-2011, -2013):
-                    continue
-                raise
-            status = str(q.get("status", ""))
+                    q = {"status": "MISSING", "clientOrderId": cid, "executedQty": "0"}
+                else:
+                    raise
+            snapshots[key] = q
+            status = str(q.get("status") or "").upper()
             meta["status"] = status
-            if status in ("FILLED", "PARTIALLY_FILLED") and dec(q.get("executedQty")) > 0:
-                triggered_key = key
-                triggered = q
-                break
-        if not triggered:
+            if first_triggered_key is None and status in ("FILLED", "PARTIALLY_FILLED") and dec(q.get("executedQty")) > 0:
+                first_triggered_key = key
+        if first_triggered_key is None:
             return None
 
-        sibling = "sl" if triggered_key == "tp" else "tp"
-        sibling_cid = str((bracket.get(sibling) or {}).get("client_id") or "")
-        if sibling_cid:
-            try:
-                self.client.cancel_order(symbol, sibling_cid)
-            except Exception as e:
-                logger.warning(f"CANCEL SIBLING FAIL | {strategy_id} | {sibling_cid} | {e}")
+        # Freeze BOTH conditional orders before any market fallback. This closes the race where a
+        # partially filled conditional keeps executing while a market close is submitted.
+        for key in ("tp", "sl"):
+            meta = bracket.get(key) or {}
+            cid = str(meta.get("client_id") or "")
+            if not cid:
+                continue
+            q = snapshots.get(key, {})
+            if str(q.get("status") or "").upper() != "FILLED":
+                try:
+                    q = self.cancel_and_confirm_terminal(symbol, cid)
+                except Exception as e:
+                    self.store.set_protection_block(strategy_id, f"BRACKET_CANCEL_UNCONFIRMED:{key}:{e}")
+                    raise RuntimeError(f"Bracket nao congelado; market fallback bloqueado: {key} {e}") from e
+                snapshots[key] = q
+                meta["status"] = str(q.get("status") or "").upper()
 
         requested_qty = dec(leg["qty"])
-        filled_qty = min(requested_qty, dec(triggered.get("executedQty")))
-        avg = dec(triggered.get("avgPrice"))
-        if avg <= 0:
-            avg = ref_price
-            logger.warning(f"NATIVE EXIT AVG AUSENTE | {strategy_id} | cid={triggered.get('clientOrderId')} | ref={ref_price}")
+        conditional_qty = D(0)
+        weighted_value = D(0)
+        active_fill_keys: List[str] = []
+        for key in ("tp", "sl"):
+            q = snapshots.get(key, {})
+            qfilled = max(D(0), dec(q.get("executedQty")))
+            if qfilled <= 0:
+                continue
+            qavg = dec(q.get("avgPrice")) or ref_price
+            conditional_qty += qfilled
+            weighted_value += qfilled * qavg
+            active_fill_keys.append(key)
+        if conditional_qty > requested_qty:
+            self.store.set_protection_block(strategy_id, f"BRACKET_OVERFILL:{conditional_qty}>{requested_qty}")
+            raise RuntimeError(f"Bracket overfill detectado {strategy_id}: filled={conditional_qty} requested={requested_qty}")
 
-        if filled_qty < requested_qty:
-            remaining = requested_qty - filled_qty
-            fallback = self.market(strategy_id, symbol, leg["side"], remaining, False, ref_price)
-            total_qty = filled_qty + fallback["qty"]
-            if total_qty > 0:
-                avg = (avg * filled_qty + fallback["price"] * fallback["qty"]) / total_qty
-                filled_qty = total_qty
-
-        reason = "NATIVE_TAKE_PROFIT" if triggered_key == "tp" else "NATIVE_STOP_LOSS"
-        logger.warning(f"NATIVE EXIT FILLED | {strategy_id} | {reason} | qty={filled_qty} avg={avg}")
+        total_qty = conditional_qty
+        total_value = weighted_value
+        close_cid = str((snapshots.get(first_triggered_key) or {}).get("clientOrderId") or
+                        (bracket.get(first_triggered_key) or {}).get("client_id") or "")
+        remaining = requested_qty - conditional_qty
+        if remaining > 0:
+            fallback = self.market(strategy_id, symbol, str(leg["side"]), remaining, False, ref_price)
+            fq = dec(fallback["qty"])
+            total_qty += fq
+            total_value += fq * dec(fallback["price"])
+            close_cid = str(fallback["client_id"])
+        if total_qty <= 0:
+            return None
+        avg = total_value / total_qty
+        if len(active_fill_keys) > 1:
+            reason = "NATIVE_BRACKET_MULTI_FILL"
+        else:
+            reason = "NATIVE_TAKE_PROFIT" if first_triggered_key == "tp" else "NATIVE_STOP_LOSS"
+        logger.warning("NATIVE EXIT FILLED | %s | %s | qty=%s avg=%s conditional=%s",
+                       strategy_id, reason, total_qty, avg, active_fill_keys)
         return self._close_record(
-            strategy_id, symbol, leg, min(requested_qty, filled_qty), avg, reason,
-            str(triggered.get("clientOrderId") or (bracket.get(triggered_key) or {}).get("client_id") or ""),
-            "ASTER_CONDITIONAL",
+            strategy_id, symbol, leg, min(requested_qty, total_qty), avg, reason,
+            close_cid, "ASTER_CONDITIONAL_OR_FALLBACK",
         )
 
     def install_basket_exit(self, strategy_id: str, symbol: str, legs: List[Dict[str, Any]],
@@ -2176,6 +2568,12 @@ class ExecutionEngine:
                         PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT, "BASKET_EXIT",
                     )
                     placed.append(cid)
+                    confirmed = self.client.query_order(symbol, cid)
+                    if str(confirmed.get("status") or "").upper() not in ("NEW", "PARTIALLY_FILLED", "FILLED"):
+                        raise RuntimeError(
+                            f"BASKET EXIT NAO CONFIRMADO | {strategy_id} | {symbol} | cid={cid} | status={confirmed.get('status')}"
+                        )
+                    resp = {**resp, **confirmed}
                 orders.append({
                     "position_side": position_side,
                     "qty": str(qty),
@@ -2187,11 +2585,15 @@ class ExecutionEngine:
                 })
         except Exception:
             if LIVE_TRADING:
+                rollback_failures = []
                 for cid in placed:
                     try:
-                        self.client.cancel_order(symbol, cid)
-                    except Exception:
-                        pass
+                        self.cancel_and_confirm_terminal(symbol, cid)
+                    except Exception as e:
+                        rollback_failures.append((cid, str(e)))
+                if rollback_failures:
+                    self.store.set_protection_block(strategy_id, f"BASKET_INSTALL_ROLLBACK_UNCONFIRMED:{rollback_failures}")
+                    logger.critical("BASKET INSTALL ROLLBACK INCOMPLETO | %s | %s", strategy_id, rollback_failures)
             raise
         logger.info(f"NATIVE BASKET EXIT | {strategy_id} | {symbol} target={trigger} orders={[(x['position_side'], x['qty'], x['type'], x['client_id']) for x in orders]}")
         return {"target_price": str(trigger), "orders": orders, "installed_at": now_iso()}
@@ -2199,14 +2601,18 @@ class ExecutionEngine:
     def cancel_basket_exit(self, symbol: str, native_exit: Optional[Dict[str, Any]]) -> None:
         if not native_exit or not LIVE_TRADING:
             return
+        failures = []
         for meta in native_exit.get("orders", []):
             cid = str(meta.get("client_id") or "")
             if not cid:
                 continue
             try:
-                self.client.cancel_order(symbol, cid)
+                self.cancel_and_confirm_terminal(symbol, cid)
             except Exception as e:
+                failures.append((cid, str(e)))
                 logger.warning(f"CANCEL BASKET EXIT FAIL | {symbol} | {cid} | {e}")
+        if failures:
+            raise RuntimeError(f"Basket exit sem cancelamento confirmado: {failures}")
 
     def basket_exit_health(self, symbol: str, native_exit: Optional[Dict[str, Any]]) -> str:
         if not native_exit:
@@ -2250,50 +2656,37 @@ class ExecutionEngine:
             cid = str(meta.get("client_id") or "")
             if not cid:
                 continue
+            ps = str(meta["position_side"])
             try:
                 q = self.client.query_order(symbol, cid)
             except AsterAPIError as e:
                 if e.code in (-2011, -2013):
-                    continue
-                raise
-            snapshots[str(meta["position_side"])] = q
-            meta["status"] = str(q.get("status", ""))
+                    q = {"status": "MISSING", "clientOrderId": cid, "executedQty": "0"}
+                else:
+                    raise
+            snapshots[ps] = q
+            meta["status"] = str(q.get("status") or "").upper()
             if meta["status"] in ("FILLED", "PARTIALLY_FILLED") and dec(q.get("executedQty")) > 0:
                 any_fill = True
         if not any_fill:
             return None
 
-        deadline = time.time() + min(2.0, ORDER_FILL_WAIT_SECONDS)
-        while time.time() < deadline:
-            pending = False
-            for meta in orders:
-                ps = str(meta["position_side"])
-                q = snapshots.get(ps, {})
-                if str(q.get("status", "")) == "FILLED":
-                    continue
-                cid = str(meta.get("client_id") or "")
-                try:
-                    q = self.client.query_order(symbol, cid)
-                    snapshots[ps] = q
-                    meta["status"] = str(q.get("status", ""))
-                except Exception:
-                    pass
-                if str((snapshots.get(ps) or {}).get("status", "")) != "FILLED":
-                    pending = True
-            if not pending:
-                break
-            time.sleep(ORDER_POLL_SECONDS)
-
+        # Once any basket conditional starts filling, freeze every still-live sibling BEFORE
+        # calculating a market remainder. Then use the post-cancel executedQty as authoritative.
         for meta in orders:
+            cid = str(meta.get("client_id") or "")
+            if not cid:
+                continue
             ps = str(meta["position_side"])
             q = snapshots.get(ps, {})
-            if str(q.get("status", "")) != "FILLED":
-                cid = str(meta.get("client_id") or "")
-                if cid:
-                    try:
-                        self.client.cancel_order(symbol, cid)
-                    except Exception:
-                        pass
+            if str(q.get("status") or "").upper() != "FILLED":
+                try:
+                    q = self.cancel_and_confirm_terminal(symbol, cid)
+                except Exception as e:
+                    self.store.set_protection_block(strategy_id, f"BASKET_PARTIAL_CANCEL_UNCONFIRMED:{ps}:{e}")
+                    raise RuntimeError(f"Basket exit nao congelado; market fallback bloqueado: {ps} {e}") from e
+                snapshots[ps] = q
+                meta["status"] = str(q.get("status") or "").upper()
 
         side_avg: Dict[str, Decimal] = {}
         side_qty: Dict[str, Decimal] = {}
@@ -2301,15 +2694,18 @@ class ExecutionEngine:
             ps = str(meta["position_side"])
             wanted = dec(meta.get("qty"))
             q = snapshots.get(ps, {})
-            filled = min(wanted, dec(q.get("executedQty")))
+            filled = max(D(0), dec(q.get("executedQty")))
+            if filled > wanted:
+                self.store.set_protection_block(strategy_id, f"BASKET_OVERFILL:{ps}:{filled}>{wanted}")
+                raise RuntimeError(f"Basket overfill {strategy_id} {ps}: filled={filled} wanted={wanted}")
             avg = dec(q.get("avgPrice"))
             if filled > 0 and avg <= 0:
                 avg = ref_price
-            remaining = max(D(0), wanted - filled)
+            remaining = wanted - filled
             if remaining > 0:
                 fallback = self.market(strategy_id, symbol, ps, remaining, False, ref_price)
-                totalq = filled + fallback["qty"]
-                avg = ((avg * filled) + (fallback["price"] * fallback["qty"])) / totalq if totalq > 0 else ref_price
+                totalq = filled + dec(fallback["qty"])
+                avg = ((avg * filled) + (dec(fallback["price"]) * dec(fallback["qty"]))) / totalq if totalq > 0 else ref_price
                 filled = totalq
             side_avg[ps] = avg if avg > 0 else ref_price
             side_qty[ps] = filled
@@ -3061,8 +3457,8 @@ class PyramidEngine:
         return desired
 
     def _sizing(self, price: Decimal, level: int) -> Optional[Dict[str, Any]]:
-        self.account.sync()
-        free = self.account.free_margin()
+        self.account.sync(force=True)
+        free = self.account.free_margin(force=True)
         desired = self._desired_notional(level, free_margin=free)
         if desired <= 0 or price <= 0:
             return None
@@ -3446,7 +3842,7 @@ class PyramidEngine:
             return {"status": "WAITING_ANCHOR", "reason": "ANCHOR_NOT_SET", "mark": price}
         level = max(1, int(st.get("next_level", 1)))
         trigger = self._trigger_price(anchor, level)
-        free_margin = self.account.free_margin()
+        free_margin = self.account.free_margin(force=True)
         desired = self._desired_notional(level, free_margin=free_margin)
         if trigger <= 0:
             return {"status": "INVALID_TRIGGER", "reason": "TRIGGER_LE_ZERO", "mark": price, "anchor": anchor, "level": level}
@@ -3622,10 +4018,10 @@ class Reconciler:
                         mismatches.append((k, e, a))
                 logger.warning(f"RECONCILE | AUTO_REPAIR_RANGE_GHOST | repaired={repaired} remaining={mismatches}")
                 if not mismatches:
-                    self.store.set_trade_gate(True, None)
-                    cleared = self.store.clear_soft_position_mismatch()
-                    logger.info(f"RECONCILE | OK APOS AUTO-REPAIR | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
-                    return True
+                    logger.info(
+                        "RECONCILE | PHYSICAL_LEDGER OK APOS AUTO-REPAIR | seguindo para validacao STATE_LEDGER | "
+                        "ledger=%s physical=%s", expected, actual,
+                    )
 
         if mismatches:
             reason = f"POSITION_MISMATCH_LEDGER expected_vs_actual={mismatches}"
@@ -3704,6 +4100,9 @@ def run_internal_regression_checks() -> None:
 
 class Bot:
     def __init__(self):
+        # Fail fast before constructing components that may read/write persistent state.
+        validate_runtime_config()
+        self.instance_lock_fh = acquire_instance_lock()
         self.stop = threading.Event()
         self.client = AsterClient(USER_ADDRESS, SIGNER_ADDRESS, SIGNER_PRIVATE_KEY)
         self.store = StateStore()
@@ -3712,6 +4111,12 @@ class Bot:
         self.news = NewsFilter()
         self.account = AccountManager(self.client, self.rules, self.store)
         self.ledger = FillLedger(LEDGER_FILE)
+        if self.store.loaded_fresh:
+            _existing_ledger = self.ledger.open_by_symbol_side()
+            if any(dec(q) > 0 for q in _existing_ledger.values()):
+                raise RuntimeError(
+                    f"STATE FRESH COM LEDGER NAO VAZIO | {_existing_ledger} | startup bloqueado para preservar ownership"
+                )
         self.exe = ExecutionEngine(self.client, self.account, self.rules, self.store, self.ledger)
         self._last_periodic_reconcile_ms = 0
         self.reconciler = Reconciler(self.client, self.store, self.ledger, self.rules)
@@ -3778,22 +4183,104 @@ class Bot:
 
         self.store.save()
 
+    def retire_legacy_range_positions(self) -> None:
+        """Retire only RANGE:* quantities proven by the durable FillLedger.
+
+        State is not used as ownership proof. This prevents stale/missing state.json from
+        causing the Directional robot to erase RANGE metadata while leaving physical RANGE
+        exposure behind, and prevents accidental closure of PYRAMID quantity aggregated on
+        the same symbol/positionSide.
+        """
+        if not RETIRE_LEGACY_RANGE_ON_STARTUP:
+            logger.warning("LEGACY RANGE RETIRE | DESABILITADO por configuracao")
+            return
+        if not LIVE_TRADING:
+            logger.info("LEGACY RANGE RETIRE | SKIP | LIVE_TRADING=0; nenhuma manutencao de exposicao/estado legado")
+            return
+
+        maintenance = self.store.state.setdefault("maintenance", {})
+        marker = maintenance.setdefault("legacy_range_retirement", {})
+        lots = self.ledger.open_lots_by_strategy_prefix("RANGE:")
+        if not lots:
+            marker.update({"completed": True, "completed_at": now_iso(), "reason": "NO_OPEN_RANGE_LEDGER_LOTS"})
+            self.store.state["range"] = {}
+            self.store.save()
+            self.store.set_operational_block("LEGACY_RANGE_RETIRE", None)
+            logger.info("LEGACY RANGE RETIRE | nenhum lot RANGE aberto no ledger; estado legado limpo")
+            return
+
+        logger.warning("LEGACY RANGE RETIRE | encontrados=%s lots | action=CLOSE_LEDGER_OWNED_ONLY", len(lots))
+        failures: List[str] = []
+        for lot in lots:
+            strategy_id = str(lot["strategy_id"])
+            symbol = str(lot["symbol"]).upper()
+            side = str(lot["side"]).upper()
+            qty = dec(lot["qty"])
+            if symbol not in SYMBOLS or side not in ("LONG", "SHORT") or qty <= 0:
+                failures.append(f"INVALID_LOT:{strategy_id}:{symbol}:{side}:{qty}")
+                continue
+
+            positions = self.client.positions()
+            physical_qty = D(0)
+            mark = dec(lot.get("entry_price"))
+            for pos in (positions if isinstance(positions, list) else []):
+                if str(pos.get("symbol", "")).upper() == symbol and str(pos.get("positionSide", "")).upper() == side:
+                    physical_qty = abs(dec(pos.get("positionAmt")))
+                    mark = dec(pos.get("markPrice") or pos.get("entryPrice") or mark)
+                    break
+            if physical_qty <= 0:
+                self.ledger.record_close_lot(str(lot["id"]), qty)
+                logger.warning("LEGACY RANGE RETIRE | physical already flat | strategy=%s symbol=%s side=%s qty=%s | ledger zerado sem ordem",
+                               strategy_id, symbol, side, dstr(qty, 8))
+                continue
+
+            close_qty = floor_step(min(qty, physical_qty), self.rules.rules[symbol].step_size)
+            if close_qty <= 0:
+                failures.append(f"NO_CLOSABLE_QTY:{strategy_id}:{symbol}:{side}:ledger={qty}:physical={physical_qty}")
+                continue
+            leg = {"id": str(lot["id"]), "side": side, "qty": str(close_qty), "entry_price": str(dec(lot["entry_price"]))}
+            logger.warning("LEGACY RANGE RETIRE | CLOSING | strategy=%s symbol=%s side=%s ledger_qty=%s physical_qty=%s close_qty=%s",
+                           strategy_id, symbol, side, dstr(qty, 8), dstr(physical_qty, 8), dstr(close_qty, 8))
+            try:
+                rec = self.exe.close_leg(strategy_id, symbol, leg, mark, "RETIRE_LEGACY_RANGE_LEDGER_OWNED", max_physical_qty=close_qty)
+                if rec is None:
+                    failures.append(f"CLOSE_SKIPPED:{strategy_id}:{symbol}:{side}:{close_qty}")
+            except Exception as exc:
+                failures.append(f"CLOSE_FAIL:{strategy_id}:{symbol}:{side}:{exc}")
+                logger.exception("LEGACY RANGE RETIRE | CLOSE FAIL | strategy=%s symbol=%s side=%s qty=%s",
+                                 strategy_id, symbol, side, dstr(close_qty, 8))
+
+        remaining = self.ledger.open_lots_by_strategy_prefix("RANGE:")
+        marker.update({
+            "completed": not bool(remaining) and not bool(failures),
+            "last_run_at": now_iso(),
+            "remaining_open_lots": [{"strategy_id": x["strategy_id"], "symbol": x["symbol"], "side": x["side"], "qty": x["qty"]} for x in remaining],
+            "failures": failures[-20:],
+        })
+        if marker["completed"]:
+            marker["completed_at"] = now_iso()
+            self.store.state["range"] = {}
+        self.store.save()
+        if remaining or failures:
+            reason = f"LEGACY_RANGE_RETIRE_INCOMPLETE remaining={remaining} failures={failures[-5:]}"
+            self.store.set_operational_block("LEGACY_RANGE_RETIRE", reason)
+            logger.error("LEGACY RANGE RETIRE | INCOMPLETO | novas entradas bloqueadas | %s", reason)
+        else:
+            self.store.set_operational_block("LEGACY_RANGE_RETIRE", None)
+            logger.warning("LEGACY RANGE RETIRE | CONCLUIDO | todos os lots RANGE legados encerrados; Direcional segue somente PYRAMID")
+
     def startup(self) -> None:
         logger.info("=" * 90)
         logger.info(f"{BOT_NAME} | version={VERSION} | LIVE_TRADING={LIVE_TRADING}")
-        if PYRAMID_GRID_PHASES != (D("0"),):
-            raise RuntimeError(
-                f"O Perpetual Direcional usa uma única escada PYRAMID por símbolo/lado; PYRAMID_GRID_PHASES deve ser somente 0, atual={PYRAMID_GRID_PHASES}"
-            )
-        if len(set(PYRAMID_GRID_PHASES)) != len(PYRAMID_GRID_PHASES) or any(x < 0 or x >= PYRAMID_STEP_PCT for x in PYRAMID_GRID_PHASES):
-            raise RuntimeError(f"PYRAMID_GRID_PHASES invalidas: {PYRAMID_GRID_PHASES}; use fases unicas entre 0 e PYRAMID_STEP_PCT")
+        validate_runtime_config()
+        logger.info("CONFIG GUARD | PASS | configuracao coerente antes de rede/ordens")
         logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False (legacy positions auto-close on startup) | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} architecture=SINGLE_LONG_SHORT_PER_SYMBOL | INDICADORES=NONE")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
-        logger.info(f"BASE ETH/HYPE: bankroll={INITIAL_BANKROLL_USD} notional={INITIAL_OPERATION_NOTIONAL_USD} | BASE BTC: bankroll={BTC_INITIAL_BANKROLL_USD} notional={BTC_INITIAL_OPERATION_NOTIONAL_USD} | RANGE_RECOVERY={RECOVERY_MULTIPLIER}x | MAX_FAIL={MAX_RECOVERY_FAILURES}")
-        logger.info(f"EXITS | RANGE_TP={RANGE_TAKE_PROFIT_PCT} RANGE_STOP={RANGE_HARD_STOP_PCT} | PYRAMID_MAX_LOSS={PYRAMID_MAX_LOSS_USD}")
+        logger.info(f"PYRAMID CAPITAL | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT}")
+        logger.info(f"PYRAMID RISK | step={PYRAMID_STEP_PCT} target_leverage={PYRAMID_LEVERAGE}x effective_leverage_cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD}")
         logger.info(f"NEWS 3-STAR={NEWS_FILTER_ENABLED} | janela=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | fail_closed={NEWS_FAIL_CLOSED}")
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
-        logger.info(f"HARDENING | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
+        logger.info(f"HARDENING | state_backup={STATE_BACKUP_FILE} | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
         logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD}")
         logger.info(f"PYRAMID | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT} leverage={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} native_risk_stop={PYRAMID_NATIVE_RISK_STOP} liq_buffer={LIQUIDATION_BUFFER_PCT} | BTC_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} | 2 bots/symbol LONG+SHORT")
         logger.info("=" * 90)
@@ -3823,36 +4310,14 @@ class Bot:
         else:
             logger.warning("MODO SIMULACAO: nenhuma ordem real sera enviada")
 
-        # RANGE is permanently retired from this Directional robot.
-        # On startup, close ONLY any legacy RANGE lots, preserving PYRAMID lots even when
-        # Aster aggregates them on the same symbol/positionSide. Then clear RANGE anchors/state.
+        # RANGE is permanently retired from this Directional robot. Retirement uses
+        # durable ledger ownership, never state.json alone, and is skipped in simulation.
         self.range_engines = []
-        if RETIRE_LEGACY_RANGE_ON_STARTUP:
-            for s in SYMBOLS:
-                legacy = self.store.state.get("range", {}).get(s, {})
-                eng = RangeEngine(s, self.client, self.md, self.news, self.account, self.exe, self.store,
-                                  allow_new_entries=False)
-                if LIVE_TRADING and legacy.get("basket"):
-                    ref_price = self.client.price(s)
-                    eng.retire_legacy_range(ref_price)
-                else:
-                    # No open RANGE basket: remove stale anchor/protect state without sending an order.
-                    legacy["basket"] = None
-                    legacy["status"] = "RETIRED"
-                    legacy["anchor"] = None
-                    legacy["protect_anchor"] = None
-                    legacy["failures"] = 0
-                    legacy["recovery_deficit"] = "0"
-                    legacy["last_result"] = "RETIRED_V28"
-                    legacy["last_update"] = now_iso()
-                    self.store.save()
-                    release_owner(self.store, s, eng.id)
-                    logger.warning(f"RANGE RETIRED | {s} | sem basket aberto; anchor legado removido")
-            if LIVE_TRADING:
-                self.account.sync(force=True)
-                self.reconciler.reconcile()
-        else:
-            logger.warning("RANGE RETIRE DESATIVADO POR ENV | RETIRE_LEGACY_RANGE_ON_STARTUP=0")
+        self.retire_legacy_range_positions()
+        if LIVE_TRADING:
+            self.account.sync(force=True)
+            self.reconciler.reconcile()
+
         if PYRAMID_ENGINE_ENABLED:
             self.pyramid_engines = []
             if not LIVE_TRADING:
@@ -4264,7 +4729,14 @@ class Bot:
                     try:
                         self.reconciler.reconcile()
                     except Exception as _re:
-                        logger.warning(f"PERIODIC RECONCILE FAIL | {_re}")
+                        reason = f"RECONCILE_UNAVAILABLE:{type(_re).__name__}:{_re}"
+                        with self.store.lock:
+                            self.store.state["trade_gate"] = {"open_allowed": False, "reason": reason, "at": now_iso()}
+                        try:
+                            self.store.save()
+                        except Exception as _save_error:
+                            logger.critical("RECONCILE FAIL-CLOSED | gate bloqueado em memoria; persistencia falhou | %s", _save_error)
+                        logger.error("PERIODIC RECONCILE FAIL-CLOSED | novas entradas bloqueadas | %s", _re)
 
                 for e in self.range_engines:
                     p = prices.get(e.symbol)
