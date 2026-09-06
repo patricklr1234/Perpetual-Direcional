@@ -97,7 +97,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.14.0-v46-runtime-verified-guard"
+VERSION = "8.18.0-v50-confirmed-cancel-guard"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -670,6 +670,26 @@ class AsterClient:
 
     def cancel_all(self, symbol: str) -> Any:
         return self._request("DELETE", "/fapi/v3/allOpenOrders", {"symbol": symbol}, signed=True)
+
+    def cancel_all_confirmed(self, symbol: str, attempts: int = 5, delay_seconds: float = 0.20) -> bool:
+        """Cancel all open orders and prove the symbol has none left.
+
+        DELETE timeout/503 is treated as execution-unknown: verification decides the result.
+        Other deterministic API errors fail closed.
+        """
+        try:
+            self.cancel_all(symbol)
+        except AsterAPIError as e:
+            if e.code != 503:
+                raise
+            logger.warning("CANCEL ALL UNKNOWN | %s | verificando openOrders antes de decidir | %s", symbol, e)
+        last: Any = None
+        for _ in range(max(1, attempts)):
+            last = self.open_orders(symbol)
+            if isinstance(last, list) and not last:
+                return True
+            time.sleep(max(0.05, delay_seconds))
+        raise RuntimeError(f"cancel_all nao confirmado para {symbol}; openOrders={last!r}")
 
     def income(self, symbol: Optional[str] = None, start_ms: Optional[int] = None, limit: int = 1000) -> Any:
         p: Dict[str, Any] = {"limit": limit}
@@ -1615,6 +1635,13 @@ class FillLedger:
             ).fetchone()
         return dec(row[0] if row else 0)
 
+    def order_owner(self, client_id: str) -> Optional[str]:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT strategy_id FROM orders WHERE client_id=?", (str(client_id),)
+            ).fetchone()
+        return str(row[0]) if row and row[0] is not None else None
+
     def rename_strategy(self, old_strategy_id: str, new_strategy_id: str,
                         symbol: Optional[str] = None, side: Optional[str] = None) -> int:
         """Renomeia ownership lógico no ledger sem tocar na posição física."""
@@ -2110,7 +2137,7 @@ class ExecutionEngine:
             self.seq += 1
             seq = self.seq
         digest = hashlib.sha1(strategy_id.encode()).hexdigest()[:6]
-        cid = f"{self.PREFIX}-{self.boot_id}-{digest}-{action[:4]}-{seq:08x}"
+        cid = f"{self.PREFIX}-{self.boot_id}-{digest}-{action[:4]}{seq:08x}"
         if len(cid) > 36:
             raise RuntimeError(f"clientOrderId interno excedeu 36 caracteres: {cid}")
         return cid
@@ -4035,9 +4062,70 @@ class Reconciler:
                 range_qty = self.ledger.open_strategy_qty(f"RANGE:{sym}", sym, side)
                 other_qty = self.ledger.open_non_range_qty(sym, side)
                 if range_qty > 0 and abs(other_qty - a) < step:
+                    # Do not erase RANGE ghost ownership while an old RANGE protective order
+                    # may still be live. Cancel only ledger-owned RANGE orders; never cancel
+                    # PYRAMID protection. Unknown/unattributed open orders make repair fail closed.
+                    repair_safe = True
+                    try:
+                        open_orders = self.client.open_orders(sym)
+                        if not isinstance(open_orders, list):
+                            raise RuntimeError(f"openOrders resposta indeterminada: {open_orders!r}")
+                        for order in open_orders:
+                            cid = str(order.get("clientOrderId") or order.get("origClientOrderId") or "")
+                            if not cid:
+                                repair_safe = False
+                                logger.error("RECONCILE | RANGE GHOST REPAIR BLOCKED | %s %s | ordem sem clientOrderId=%s", sym, side, order)
+                                break
+                            owner = self.ledger.order_owner(cid)
+                            if owner is None:
+                                repair_safe = False
+                                logger.error("RECONCILE | RANGE GHOST REPAIR BLOCKED | %s %s | ordem sem ownership cid=%s", sym, side, cid)
+                                break
+                            if owner.startswith("RANGE:"):
+                                try:
+                                    self.client.cancel_order(sym, cid)
+                                except Exception as cancel_error:
+                                    repair_safe = False
+                                    logger.error("RECONCILE | RANGE GHOST CANCEL FAIL | %s %s | cid=%s | %s", sym, side, cid, cancel_error)
+                                    break
+                        if repair_safe:
+                            verify = self.client.open_orders(sym)
+                            if not isinstance(verify, list):
+                                raise RuntimeError(f"openOrders verify indeterminado: {verify!r}")
+                            for order in verify:
+                                cid = str(order.get("clientOrderId") or order.get("origClientOrderId") or "")
+                                owner = self.ledger.order_owner(cid) if cid else None
+                                if owner is None or owner.startswith("RANGE:"):
+                                    repair_safe = False
+                                    logger.error("RECONCILE | RANGE GHOST REPAIR UNCONFIRMED | %s %s | cid=%s owner=%s", sym, side, cid or '<missing>', owner)
+                                    break
+                        if repair_safe:
+                            # Re-read physical quantity after selective cancellations. The original
+                            # snapshot may be stale if a PYRAMID native stop filled concurrently.
+                            fresh_positions = self.client.positions(sym)
+                            if not isinstance(fresh_positions, list):
+                                raise RuntimeError(f"positionRisk verify indeterminado: {fresh_positions!r}")
+                            fresh_side_qty = D(0)
+                            for p in fresh_positions:
+                                if str(p.get("symbol", "")).upper() == sym and str(p.get("positionSide", "")).upper() == side:
+                                    fresh_side_qty = abs(dec(p.get("positionAmt")))
+                            if abs(fresh_side_qty - other_qty) >= step:
+                                repair_safe = False
+                                logger.error(
+                                    "RECONCILE | RANGE GHOST REPAIR RACE | %s %s | snapshot=%s fresh=%s expected_non_range=%s",
+                                    sym, side, a, fresh_side_qty, other_qty,
+                                )
+                    except Exception as order_guard_error:
+                        repair_safe = False
+                        logger.error("RECONCILE | RANGE GHOST ORDER GUARD FAIL | %s %s | %s", sym, side, order_guard_error)
+
+                    if not repair_safe:
+                        self.store.set_trade_gate(False, f"RANGE_GHOST_ORDER_UNCONFIRMED:{sym}:{side}")
+                        continue
+
                     removed = self.ledger.zero_open_strategy_side(
                         f"RANGE:{sym}", sym, side,
-                        reason=f"physical={a} fully_explained_by_non_range={other_qty}",
+                        reason=f"physical={a} fully_explained_by_non_range={other_qty}; range_orders=CONFIRMED_NONE",
                     )
                     if removed > 0:
                         repaired.append((k, removed))
@@ -4409,8 +4497,8 @@ class Bot:
             if x.get("symbol") and abs(dec(x.get("positionAmt"))) > 0
         )
         for symbol in sorted(symbols):
-            self.client.cancel_all(symbol)
-            logger.warning(f"EMERGENCY RESET | ordens canceladas | {symbol}")
+            self.client.cancel_all_confirmed(symbol)
+            logger.warning(f"EMERGENCY RESET | ordens canceladas e CONFIRMADAS | {symbol}")
 
         for p in (positions if isinstance(positions, list) else []):
             qty = abs(dec(p.get("positionAmt")))
@@ -4460,9 +4548,16 @@ class Bot:
         if not LIVE_TRADING:
             return
         logger.error("HARD KILL EXECUTION | cancelando ordens e fechando posicoes conhecidas")
+        cancel_guard_ok = True
         for s in SYMBOLS:
-            try: self.client.cancel_all(s)
-            except Exception as e: logger.error(f"HARD KILL cancel {s} | {e}")
+            try:
+                self.client.cancel_all_confirmed(s)
+            except Exception as e:
+                cancel_guard_ok = False
+                logger.critical(f"HARD KILL cancel NAO CONFIRMADO {s} | {e}")
+        if not cancel_guard_ok:
+            logger.critical("HARD KILL | fechamento a mercado adiado: cancelamento de ordens nao foi confirmado em todos os simbolos")
+            return
         for e in self.range_engines:
             try:
                 st = e.st(); b = st.get("basket")
