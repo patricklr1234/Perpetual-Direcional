@@ -1,38 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ASTER PERPETUAL BOT V18 - BTC / ETH / HYPE - SEM INDICADORES
-=============================================================
-Motores independentes:
-  A) RANGE_1PCT: gatilho EXCLUSIVAMENTE por +/-1% do ponto zero, sem indicador,
-     alvo +1%, hedge/recovery alternado, recovery 4x minimo com dimensionamento
-     dinamico liquido e protecao apos 2 falhas.
-  B) PYRAMID_1PCT: dois robos independentes por ativo (LONG e SHORT), sem indicador.
-     Cada robo fixa um ponto zero persistente. LONG abre US$100 no +1% e adiciona
-     5% do caixa virtual a cada novo nivel de +1%; SHORT faz o espelho em -1%.
-     Recuos nao reduzem posicao. Cada robo para e fecha sua propria cesta quando
-     a perda liquida estimada alcanca o caixa virtual de US$10.
+PERPETUAL DIRECIONAL — BTC / ETH / HYPE
+=======================================
 
-Ativos: BTCUSDT, ETHUSDT e HYPEUSDT.
-Conta real Aster Pro USDT perpetual, Hedge Mode e margem ISOLATED.
-A estrategia PYRAMID usa apenas movimentacao percentual do preco a partir do anchor.
-Nenhum indicador tecnico e utilizado.
+Identidade do robô:
+  - Nome operacional: ASTER_PERPETUAL_DIRECIONAL
+  - Estratégia ativa: PYRAMID 1% independente por símbolo e lado.
+  - RANGE está permanentemente aposentado neste robô.
 
-Seguranca:
-  - LIVE_TRADING=0 por padrao; para conta real use LIVE_TRADING=1.
-  - SOFT kill-switch bloqueia novas entradas, mas continua gerenciando posicoes.
-  - HARD kill-switch cancela ordens e tenta fechar posicoes do bot.
-  - Noticias de alto impacto podem bloquear novas entradas quando habilitadas.
-  - Estado persistente em BOT_DIR/state.json.
-  - Ordens usam clientOrderId prefixado por estrategia para reconciliacao.
-  - Estrategias simultaneas no mesmo simbolo habilitadas por padrao.
+PYRAMID:
+  - Seis estratégias independentes: BTC/ETH/HYPE x LONG/SHORT.
+  - Uma única escada por símbolo/lado, sem subgrid cruzado com outra conta.
+  - Anchor persistente por símbolo/lado.
+  - Primeira entrada com notional configurado (padrão US$100).
+  - Adições usam margem física livre real da conta, não crescimento do bankroll lógico.
+  - Bankroll lógico padrão US$10 por estratégia.
+  - Limite lógico de perda padrão US$10 por estratégia.
+  - Leverage alvo padrão 10x e teto efetivo padrão 10x para novas adições.
+    Posições antigas com leverage herdada maior continuam gerenciadas/protegidas,
+    mas não recebem novas adições até o símbolo ficar flat e poder ser resetado.
 
-Dependencias:
-  pip install requests websocket-client beautifulsoup4 eth-account
+Proteção:
+  - STOP_MARKET nativa por estratégia/lado.
+  - O stop efetivo considera tanto MAX_LOSS_USD quanto buffer antes da liquidação.
+  - Proteção nativa é verificada em modo fail-closed.
+  - Se uma nova adição não puder receber proteção confirmada, a cesta daquela
+    estratégia é encerrada para não permanecer exposição aumentada e desprotegida.
 
-Nunca coloque seed phrase ou a chave privada da carteira principal no Railway.
-Use somente a chave privada da API Wallet dedicada e autorizada na Aster.
+Execução e consistência:
+  - Hedge Mode obrigatório, margem ISOLATED, Single-Asset.
+  - FillLedger SQLite + state.json + posição física da Aster são reconciliados em conjunto.
+  - HTTP 503/timeout de transporte em envio de ordem é tratado como UNKNOWN e
+    reconciliado por clientOrderId, sem reenvio cego.
+  - RANGE legado existe apenas como compatibilidade de migração/retirada e nunca
+    volta a abrir novas posições.
+
+Persistência:
+  - BOT_DIR/state.json
+  - BOT_DIR/fill_ledger.sqlite3
+  - BOT_DIR/trades.jsonl
+  - BOT_DIR/order_journal.jsonl
+
+Segurança:
+  - LIVE_TRADING=0 por padrão.
+  - SOFT kill bloqueia novas entradas e continua gerenciando posições.
+  - HARD kill cancela ordens e tenta encerrar posições do robô.
+  - Notícias de alto impacto podem bloquear entradas.
+  - Nunca use seed phrase/chave privada da carteira principal; use somente a API Wallet.
 """
+
 
 from __future__ import annotations
 
@@ -79,8 +96,8 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "7.6.0-v28-real-margin-single-pyramid"
-BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL_V28"
+VERSION = "8.0.0-v32-config-guard-ledger-retire"
+BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
@@ -129,7 +146,7 @@ RANGE_TRIGGER_PCT = D(os.getenv("RANGE_TRIGGER_PCT", "0.01"))
 RANGE_TAKE_PROFIT_PCT = D(os.getenv("RANGE_TAKE_PROFIT_PCT", "0.01"))
 RANGE_HARD_STOP_PCT = D(os.getenv("RANGE_HARD_STOP_PCT", "0.02"))
 RANGE_REARM_PCT = D(os.getenv("RANGE_REARM_PCT", "0.03"))
-RANGE_ENGINE_ENABLED = False  # V27: RANGE definitivamente aposentado neste robo
+RANGE_ENGINE_ENABLED = False  # RANGE definitivamente aposentado neste robô.
 
 PROTECTIVE_WATCHDOG_SECONDS = float(os.getenv("PROTECTIVE_WATCHDOG_SECONDS", "5"))
 
@@ -146,7 +163,7 @@ PYRAMID_GRID_PHASES = tuple(
 )
 PYRAMID_GRID_COUNT = max(1, len(PYRAMID_GRID_PHASES))
 PYRAMID_GRID_CAPITAL_SHARE = D(1) / D(PYRAMID_GRID_COUNT)
-# V28: adicionais PYRAMID usam margem física livre da conta, não bankroll/equity virtual.
+# Adicionais PYRAMID usam margem física livre da conta, não bankroll/equity virtual.
 # Compatibilidade: se PYRAMID_ADD_FREE_MARGIN_PCT não existir, aceita o antigo
 # PYRAMID_ADD_BANKROLL_PCT como fallback de configuração.
 PYRAMID_ADD_FREE_MARGIN_PCT = D(os.getenv(
@@ -156,7 +173,10 @@ PYRAMID_ADD_FREE_MARGIN_PCT = D(os.getenv(
 PYRAMID_ADD_BANKROLL_PCT = PYRAMID_ADD_FREE_MARGIN_PCT  # alias legado
 PYRAMID_BTC_MIN_ADD_NOTIONAL_USD = D(os.getenv("PYRAMID_BTC_MIN_ADD_NOTIONAL_USD", "100"))
 PYRAMID_LEVERAGE = int(os.getenv("PYRAMID_LEVERAGE", "10"))
+PYRAMID_MAX_EFFECTIVE_LEVERAGE = int(os.getenv("PYRAMID_MAX_EFFECTIVE_LEVERAGE", str(PYRAMID_LEVERAGE)))
 PYRAMID_MAX_LOSS_USD = D(os.getenv("PYRAMID_MAX_LOSS_USD", "10"))
+PYRAMID_NATIVE_RISK_STOP = os.getenv("PYRAMID_NATIVE_RISK_STOP", "1") == "1"
+PYRAMID_NATIVE_STOP_REFRESH_SECONDS = float(os.getenv("PYRAMID_NATIVE_STOP_REFRESH_SECONDS", "5"))
 PYRAMID_MAX_LEVELS_PER_TICK = int(os.getenv("PYRAMID_MAX_LEVELS_PER_TICK", "20"))
 PYRAMID_APPLY_NEWS_FILTER = os.getenv("PYRAMID_APPLY_NEWS_FILTER", "1") == "1"
 PYRAMID_STOP_AFTER_MAX_LOSS = os.getenv("PYRAMID_STOP_AFTER_MAX_LOSS", "1") == "1"
@@ -193,10 +213,60 @@ MAX_TOTAL_SYMBOL_NOTIONAL_USD = D(os.getenv("MAX_TOTAL_SYMBOL_NOTIONAL_USD", "30
 BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD = D(os.getenv("BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD", "2500"))
 MAX_PRICE_AGE_FOR_ENTRY_SECONDS = float(os.getenv("MAX_PRICE_AGE_FOR_ENTRY_SECONDS", "4"))
 RECONCILE_INTERVAL_SECONDS = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "10"))
+STATE_LEDGER_MISMATCH_CONFIRMATIONS = int(os.getenv("STATE_LEDGER_MISMATCH_CONFIRMATIONS", "2"))
+UNKNOWN_ORDER_QUERY_ATTEMPTS = int(os.getenv("UNKNOWN_ORDER_QUERY_ATTEMPTS", "12"))
+UNKNOWN_ORDER_QUERY_DELAY_SECONDS = float(os.getenv("UNKNOWN_ORDER_QUERY_DELAY_SECONDS", "0.5"))
 LEDGER_RECONCILE_ON_STARTUP = os.getenv("LEDGER_RECONCILE_ON_STARTUP", "1") == "1"
 SELF_TEST_ON_STARTUP = os.getenv("SELF_TEST_ON_STARTUP", "1") == "1"
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+def validate_runtime_config() -> None:
+    """Fail fast on contradictory/unsafe environment configuration before network or trading."""
+    errors: List[str] = []
+
+    def require(cond: bool, message: str) -> None:
+        if not cond:
+            errors.append(message)
+
+    require(1 <= MIN_LEVERAGE <= MAX_REQUESTED_LEVERAGE <= BOT_HARD_MAX_LEVERAGE <= API_HARD_MAX_LEVERAGE,
+            f"leverage global invalida: MIN={MIN_LEVERAGE} requested={MAX_REQUESTED_LEVERAGE} bot_cap={BOT_HARD_MAX_LEVERAGE} api_cap={API_HARD_MAX_LEVERAGE}")
+    require(1 <= PYRAMID_LEVERAGE <= PYRAMID_MAX_EFFECTIVE_LEVERAGE <= BOT_HARD_MAX_LEVERAGE,
+            f"leverage PYRAMID invalida: target={PYRAMID_LEVERAGE} effective_cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE} bot_cap={BOT_HARD_MAX_LEVERAGE}")
+    require(D(0) < LEVERAGE_HEADROOM <= D(1), f"LEVERAGE_HEADROOM deve estar em (0,1], atual={LEVERAGE_HEADROOM}")
+    require(D(0) <= LIQUIDATION_BUFFER_PCT < D(1), f"LIQUIDATION_BUFFER_PCT invalido: {LIQUIDATION_BUFFER_PCT}")
+    require(ADVERSE_MOVE_SAFETY_MULTIPLIER >= D(1), f"ADVERSE_MOVE_SAFETY_MULTIPLIER deve ser >=1, atual={ADVERSE_MOVE_SAFETY_MULTIPLIER}")
+    require(MIN_FREE_WALLET_BUFFER_USD >= D(0), f"MIN_FREE_WALLET_BUFFER_USD nao pode ser negativo: {MIN_FREE_WALLET_BUFFER_USD}")
+    require(D(0) < MAX_MARGIN_FRACTION_PER_STRATEGY <= D(1), f"MAX_MARGIN_FRACTION_PER_STRATEGY deve estar em (0,1], atual={MAX_MARGIN_FRACTION_PER_STRATEGY}")
+
+    for name, value in (("PYRAMID_BANKROLL_USD", PYRAMID_BANKROLL_USD), ("PYRAMID_INITIAL_NOTIONAL_USD", PYRAMID_INITIAL_NOTIONAL_USD),
+                        ("PYRAMID_MAX_LOSS_USD", PYRAMID_MAX_LOSS_USD), ("PYRAMID_BTC_MIN_ADD_NOTIONAL_USD", PYRAMID_BTC_MIN_ADD_NOTIONAL_USD),
+                        ("MAX_RECOVERY_NOTIONAL_USD", MAX_RECOVERY_NOTIONAL_USD), ("BTC_MAX_RECOVERY_NOTIONAL_USD", BTC_MAX_RECOVERY_NOTIONAL_USD),
+                        ("MAX_TOTAL_SYMBOL_NOTIONAL_USD", MAX_TOTAL_SYMBOL_NOTIONAL_USD), ("BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD", BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD)):
+        require(value > 0, f"{name} deve ser >0, atual={value}")
+
+    require(D(0) < PYRAMID_STEP_PCT < D(1), f"PYRAMID_STEP_PCT deve estar em (0,1), atual={PYRAMID_STEP_PCT}")
+    require(D(0) < PYRAMID_ADD_FREE_MARGIN_PCT <= D(1), f"PYRAMID_ADD_FREE_MARGIN_PCT deve estar em (0,1], atual={PYRAMID_ADD_FREE_MARGIN_PCT}")
+    require(PYRAMID_MAX_LEVELS_PER_TICK >= 1, f"PYRAMID_MAX_LEVELS_PER_TICK deve ser >=1, atual={PYRAMID_MAX_LEVELS_PER_TICK}")
+    require(PYRAMID_NATIVE_STOP_REFRESH_SECONDS > 0, f"PYRAMID_NATIVE_STOP_REFRESH_SECONDS deve ser >0, atual={PYRAMID_NATIVE_STOP_REFRESH_SECONDS}")
+    require(PYRAMID_GRID_PHASES == (D("0"),), f"PYRAMID_GRID_PHASES deve ser somente (0,), atual={PYRAMID_GRID_PHASES}")
+    require(MAX_TOTAL_SYMBOL_NOTIONAL_USD >= PYRAMID_INITIAL_NOTIONAL_USD, "MAX_TOTAL_SYMBOL_NOTIONAL_USD menor que PYRAMID_INITIAL_NOTIONAL_USD")
+    require(BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD >= PYRAMID_INITIAL_NOTIONAL_USD, "BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD menor que PYRAMID_INITIAL_NOTIONAL_USD")
+    require(PROTECTIVE_WORKING_TYPE in ("MARK_PRICE", "CONTRACT_PRICE"), f"PROTECTIVE_WORKING_TYPE invalido: {PROTECTIVE_WORKING_TYPE}")
+
+    for name, value in (("HTTP_TIMEOUT", HTTP_TIMEOUT), ("ORDER_FILL_WAIT_SECONDS", ORDER_FILL_WAIT_SECONDS), ("ORDER_POLL_SECONDS", ORDER_POLL_SECONDS),
+                        ("MAIN_LOOP_SECONDS", MAIN_LOOP_SECONDS), ("REST_PRICE_FALLBACK_SECONDS", REST_PRICE_FALLBACK_SECONDS), ("HEARTBEAT_SECONDS", HEARTBEAT_SECONDS),
+                        ("ACCOUNT_SYNC_SECONDS", ACCOUNT_SYNC_SECONDS), ("PROTECTIVE_WATCHDOG_SECONDS", PROTECTIVE_WATCHDOG_SECONDS),
+                        ("MAX_PRICE_AGE_FOR_ENTRY_SECONDS", MAX_PRICE_AGE_FOR_ENTRY_SECONDS), ("RECONCILE_INTERVAL_SECONDS", RECONCILE_INTERVAL_SECONDS),
+                        ("UNKNOWN_ORDER_QUERY_DELAY_SECONDS", UNKNOWN_ORDER_QUERY_DELAY_SECONDS)):
+        require(value > 0, f"{name} deve ser >0, atual={value}")
+    require(RECV_WINDOW > 0, f"RECV_WINDOW deve ser >0, atual={RECV_WINDOW}")
+    require(STATE_LEDGER_MISMATCH_CONFIRMATIONS >= 1, f"STATE_LEDGER_MISMATCH_CONFIRMATIONS deve ser >=1, atual={STATE_LEDGER_MISMATCH_CONFIRMATIONS}")
+    require(UNKNOWN_ORDER_QUERY_ATTEMPTS >= 1, f"UNKNOWN_ORDER_QUERY_ATTEMPTS deve ser >=1, atual={UNKNOWN_ORDER_QUERY_ATTEMPTS}")
+    require(NEWS_WINDOW_BEFORE_MIN >= 0 and NEWS_WINDOW_AFTER_MIN >= 0 and NEWS_REFRESH_SECONDS > 0 and NEWS_MAX_STALE_SECONDS > 0 and NEWS_LOOKAHEAD_DAYS >= 1, "configuracao NEWS invalida")
+
+    if errors:
+        raise RuntimeError("CONFIG INVALIDA | " + " | ".join(errors))
 
 # -----------------------------------------------------------------------------
 # LOGGING
@@ -348,6 +418,15 @@ class AsterClient:
         except AsterAPIError:
             self.api_error_streak += 1
             raise
+        except (requests.Timeout, requests.ConnectionError) as e:
+            self.api_error_streak += 1
+            if method.upper() == "POST" and path == "/fapi/v3/order":
+                raise AsterAPIError(
+                    f"TRANSPORT UNKNOWN EXECUTION | {type(e).__name__}: {e}",
+                    503,
+                    {"path": path, "method": method},
+                ) from e
+            raise AsterAPIError(str(e)) from e
         except Exception as e:
             self.api_error_streak += 1
             raise AsterAPIError(str(e)) from e
@@ -443,8 +522,8 @@ class AsterClient:
             return self._request("POST", "/fapi/v3/order", p, signed=True)
         except AsterAPIError as e:
             if e.code == 503:
-                for _ in range(10):
-                    time.sleep(0.5)
+                for _ in range(max(1, UNKNOWN_ORDER_QUERY_ATTEMPTS)):
+                    time.sleep(max(0.05, UNKNOWN_ORDER_QUERY_DELAY_SECONDS))
                     try:
                         return self.query_order(symbol, client_id)
                     except Exception:
@@ -472,8 +551,8 @@ class AsterClient:
             return self._request("POST", "/fapi/v3/order", p, signed=True)
         except AsterAPIError as e:
             if e.code == 503:
-                for _ in range(10):
-                    time.sleep(0.5)
+                for _ in range(max(1, UNKNOWN_ORDER_QUERY_ATTEMPTS)):
+                    time.sleep(max(0.05, UNKNOWN_ORDER_QUERY_DELAY_SECONDS))
                     try:
                         return self.query_order(symbol, client_id)
                     except Exception:
@@ -988,6 +1067,7 @@ def empty_pyramid_state(symbol: str, side: str) -> Dict[str, Any]:
         "last_net_pnl": "0",
         "levels_filled": 0,
         "last_trigger_price": None,
+        "native_risk_stop": None,
         "last_update": now_iso(),
     }
 
@@ -1014,6 +1094,7 @@ def empty_pyramid_grid_state(symbol: str, side: str, grid_id: str, phase: Decima
         "last_net_pnl": "0",
         "levels_filled": 0,
         "last_trigger_price": None,
+        "native_risk_stop": None,
         "last_update": now_iso(),
     }
 
@@ -1028,7 +1109,7 @@ def fresh_state() -> Dict[str, Any]:
         "protection_blocks": {},
         "range": {s: empty_range_state(s) for s in SYMBOLS},
         "pyramid": {f"{s}:{side}": empty_pyramid_state(s, side) for s in SYMBOLS for side in ("LONG", "SHORT")},
-        # V28: bucket mantido apenas para compatibilidade com V25-V27; novos G0 não são criados.
+        # Bucket mantido apenas para compatibilidade com estados antigos; novos G0 não são criados.
         "pyramid_grids": {},
         "symbol_owner": {s: None for s in SYMBOLS},
         "last_wallet": {},
@@ -1062,7 +1143,7 @@ class StateStore:
             for side in ("LONG", "SHORT"):
                 pkey = f"{s}:{side}"
                 st["pyramid"].setdefault(pkey, empty_pyramid_state(s, side))
-                # V28: não cria novos pyramid_grids. Estados G0 antigos, se existirem,
+                # Não cria novos pyramid_grids. Estados G0 antigos, se existirem,
                 # são tratados de forma segura no startup.
         st["version"] = VERSION
         return st
@@ -1104,7 +1185,7 @@ class StateStore:
             else:
                 blocks.pop(strategy_id, None)
             self.save()
-        logger.warning("PROTECTION BLOCK V16 | strategy=%s | active=%s | reason=%s", strategy_id, bool(reason), reason)
+        logger.warning("PROTECTION BLOCK | strategy=%s | active=%s | reason=%s", strategy_id, bool(reason), reason)
 
     def clear_soft_position_mismatch(self) -> bool:
         with self.lock:
@@ -1115,7 +1196,7 @@ class StateStore:
                 return False
             self.state["kill_switch"] = {"mode": "OFF", "reason": None, "at": now_iso()}
             self.save()
-        logger.warning("KILL SWITCH AUTO-CLEAR V16 | POSITION_MISMATCH reconciliado | novas entradas liberadas")
+        logger.warning("KILL SWITCH AUTO-CLEAR | POSITION_MISMATCH reconciliado | novas entradas liberadas")
         return True
 
 # -----------------------------------------------------------------------------
@@ -1182,7 +1263,7 @@ class FillLedger:
             self.db.execute("DELETE FROM lots")
             self.db.execute("DELETE FROM orders")
             self.db.commit()
-        logger.warning("LEDGER RESET V15 | durable fill ledger cleared after confirmed emergency reset")
+        logger.warning("LEDGER RESET | durable fill ledger cleared after confirmed emergency reset")
 
     def order_state(self, client_id: str, strategy_id: str, symbol: str, position_side: str,
                     action: str, order_type: str, requested_qty: Decimal, status: str,
@@ -1246,6 +1327,20 @@ class FillLedger:
                                   (strategy_id, symbol, side)).fetchone()
         return dec(row[0] if row else 0)
 
+    def open_lots_by_strategy_prefix(self, prefix: str) -> List[Dict[str, Any]]:
+        """Return durable open lots owned by strategies whose id starts with prefix."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT leg_id,strategy_id,symbol,position_side,open_qty,entry_price,source "
+                "FROM lots WHERE strategy_id LIKE ? AND CAST(open_qty AS REAL)>0 ORDER BY opened_ms,leg_id",
+                (f"{prefix}%",),
+            ).fetchall()
+        return [
+            {"id": str(leg_id), "strategy_id": str(strategy_id), "symbol": str(symbol).upper(),
+             "side": str(side).upper(), "qty": str(qty), "entry_price": str(entry_price), "source": str(source)}
+            for leg_id, strategy_id, symbol, side, qty, entry_price, source in rows
+        ]
+
     def zero_open_strategy_side(self, strategy_id: str, symbol: str, side: str, reason: str = "AUTO_REPAIR") -> Decimal:
         """Zera apenas lots virtuais de uma estratégia/lado confirmados como fantasmas.
 
@@ -1266,7 +1361,7 @@ class FillLedger:
                 (t, strategy_id, symbol, side),
             )
             self.db.commit()
-        logger.warning(f"LEDGER AUTO-REPAIR V21 | strategy={strategy_id} {symbol} {side} removed_ghost_qty={removed} reason={reason}")
+        logger.warning(f"LEDGER AUTO-REPAIR | strategy={strategy_id} {symbol} {side} removed_ghost_qty={removed} reason={reason}")
         return removed
 
     def open_non_range_qty(self, symbol: str, side: str) -> Decimal:
@@ -1305,7 +1400,7 @@ class FillLedger:
             self.db.commit()
         if count:
             logger.warning(
-                f"LEDGER STRATEGY MIGRATION V28 | {old_strategy_id} -> {new_strategy_id} "
+                f"LEDGER STRATEGY MIGRATION | {old_strategy_id} -> {new_strategy_id} "
                 f"| symbol={symbol or '*'} side={side or '*'} lots={count}"
             )
         return count
@@ -1331,7 +1426,7 @@ class FillLedger:
                         if q > 0 and ep > 0:
                             self.record_open_lot(lid, str(st.get("strategy")), str(st.get("symbol")), str(leg.get("side")), q, ep, lid, "STATE_BOOTSTRAP"); seeded += 1
         if seeded:
-            logger.warning(f"LEDGER BOOTSTRAP V18 | lots_seeded={seeded} from state.json")
+            logger.warning(f"LEDGER BOOTSTRAP | lots_seeded={seeded} from state.json")
         return seeded
 
 class OrderManager:
@@ -1352,6 +1447,16 @@ class OrderManager:
                                     str(resp.get("status") or "SUBMITTED"), resp.get("orderId"),
                                     dec(resp.get("executedQty")), dec(resp.get("avgPrice")), reason=reason)
             return resp
+        except AsterAPIError as e:
+            status = "UNKNOWN" if e.code == 503 else "REJECTED"
+            self.ledger.order_state(client_id, strategy_id, symbol, position_side, action, "MARKET", qty,
+                                    status, reason=reason)
+            if status == "UNKNOWN":
+                logger.critical(
+                    "ORDER EXECUTION UNKNOWN | strategy=%s symbol=%s side=%s posSide=%s qty=%s cid=%s",
+                    strategy_id, symbol, side, position_side, qty, client_id,
+                )
+            raise
         except Exception:
             self.ledger.order_state(client_id, strategy_id, symbol, position_side, action, "MARKET", qty,
                                     "REJECTED", reason=reason)
@@ -1369,6 +1474,16 @@ class OrderManager:
                                     str(resp.get("status") or "SUBMITTED"), resp.get("orderId"),
                                     dec(resp.get("executedQty")), dec(resp.get("avgPrice")), reason=reason)
             return resp
+        except AsterAPIError as e:
+            status = "UNKNOWN" if e.code == 503 else "REJECTED"
+            self.ledger.order_state(client_id, strategy_id, symbol, position_side, "PROTECT", order_type, qty,
+                                    status, reason=reason)
+            if status == "UNKNOWN":
+                logger.critical(
+                    "PROTECTIVE ORDER EXECUTION UNKNOWN | strategy=%s symbol=%s posSide=%s qty=%s cid=%s",
+                    strategy_id, symbol, position_side, qty, client_id,
+                )
+            raise
         except Exception:
             self.ledger.order_state(client_id, strategy_id, symbol, position_side, "PROTECT", order_type, qty,
                                     "REJECTED", reason=reason)
@@ -1560,7 +1675,7 @@ class AccountManager:
                 if desired_notional_override is not None else classic_notional
             recovery_cap = configured_max_recovery_notional(symbol)
             if desired_notional > recovery_cap:
-                logger.warning(f"RECOVERY CAP V15 | {symbol} | requested={desired_notional} capped={recovery_cap} level={recovery_level}")
+                logger.warning(f"RECOVERY CAP | {symbol} | requested={desired_notional} capped={recovery_cap} level={recovery_level}")
                 desired_notional = recovery_cap
             cap, meta = self.safe_leverage_cap(symbol, desired_notional, adverse_distance_pct)
             lev = cap
@@ -1576,7 +1691,7 @@ class AccountManager:
         current_symbol_notional = self.current_symbol_notional(symbol)
         symbol_cap = configured_max_total_symbol_notional(symbol)
         if current_symbol_notional + actual_notional > symbol_cap:
-            logger.warning(f"SYMBOL EXPOSURE CAP V15 | {symbol} | current={current_symbol_notional} new={actual_notional} cap={symbol_cap}")
+            logger.warning(f"SYMBOL EXPOSURE CAP | {symbol} | current={current_symbol_notional} new={actual_notional} cap={symbol_cap}")
             return None
         estimated_adverse_loss = actual_notional * adverse_distance_pct
         if fresh_operation:
@@ -1686,21 +1801,33 @@ class AccountManager:
         # O sizing continua sendo feito pelo notional da estrategia; leverage nao muda
         # PnL por unidade de movimento, apenas margem/liquidacao. open_leg() recalcula
         # a margem efetiva com o leverage compartilhado antes de enviar a ordem.
-        if current < MIN_LEVERAGE or current > min(MAX_REQUESTED_LEVERAGE, BOT_HARD_MAX_LEVERAGE, API_HARD_MAX_LEVERAGE):
+        absolute_cap = min(MAX_REQUESTED_LEVERAGE, BOT_HARD_MAX_LEVERAGE, API_HARD_MAX_LEVERAGE)
+        if current < MIN_LEVERAGE or current > absolute_cap:
             logger.warning(
-                f"LEVERAGE ENTRY BLOCK V23 | {symbol} | current={current}x requested={requested}x "
-                f"posicoes_abertas={open_count} | leverage ativo fora dos limites do bot"
+                f"LEVERAGE ENTRY BLOCK | {symbol} | current={current}x requested={requested}x "
+                f"posicoes_abertas={open_count} | leverage ativo fora dos limites absolutos"
+            )
+            return None
+
+        # Direcional is intentionally a 10x Pyramid architecture by default.
+        # Existing inherited leverage above this ceiling is managed/protected, but
+        # no new level is allowed until the symbol becomes flat and can be reset.
+        effective_cap = max(MIN_LEVERAGE, min(PYRAMID_MAX_EFFECTIVE_LEVERAGE, absolute_cap))
+        if current > effective_cap:
+            logger.critical(
+                f"LEVERAGE ADD BLOCK | {symbol} | current={current}x cap={effective_cap}x "
+                f"requested={requested}x positions={open_count} | existing positions remain managed"
             )
             return None
 
         if current != requested:
             logger.warning(
-                f"LEVERAGE ADOPT V23 | {symbol} | current={current}x requested={requested}x "
+                f"LEVERAGE ADOPT | {symbol} | current={current}x requested={requested}x "
                 f"posicoes_abertas={open_count} | usando leverage compartilhado ja ativo; sem alterar exchange"
             )
         else:
             logger.info(
-                f"LEVERAGE REUSE V23 | {symbol} | current={current}x requested={requested}x "
+                f"LEVERAGE REUSE | {symbol} | current={current}x requested={requested}x "
                 f"posicoes_abertas={open_count}"
             )
         return current
@@ -1804,7 +1931,7 @@ class ExecutionEngine:
                                     "OPEN" if opening else "CLOSE", "MARKET", qty,
                                     "FILLED", order_id, filled, avg, commission, realized,
                                     "MARKET_EXECUTION")
-            logger.info(f"ORDER FILLED V15 | {strategy_id} | {'OPEN' if opening else 'CLOSE'} {side} posSide={position_side} requested_qty={qty} filled_qty={filled} avg={avg} commission={commission} realized={realized} cid={cid}")
+            logger.info(f"ORDER FILLED | {strategy_id} | {'OPEN' if opening else 'CLOSE'} {side} posSide={position_side} requested_qty={qty} filled_qty={filled} avg={avg} commission={commission} realized={realized} cid={cid}")
             return {"qty": filled, "price": avg, "client_id": cid, "order_id": order_id,
                     "status": "FILLED", "time": submitted_ms, "price_source": "EXCHANGE_AVG",
                     "commission_actual": commission, "realized_pnl_exchange": realized}
@@ -1815,7 +1942,7 @@ class ExecutionEngine:
         effective_leverage = self.account.prepare_leverage_for_open(symbol, requested_leverage)
         if effective_leverage is None:
             logger.warning(
-                f"OPEN BLOCK LEVERAGE V23 | {strategy_id} | {symbol} {position_side} | "
+                f"OPEN BLOCK LEVERAGE | {strategy_id} | {symbol} {position_side} | "
                 f"requested={requested_leverage}x reason={reason}"
             )
             return None
@@ -1830,7 +1957,7 @@ class ExecutionEngine:
         free_margin = self.account.free_margin()
         if effective_margin > free_margin:
             logger.warning(
-                f"OPEN BLOCK MARGIN V23 | {strategy_id} | {symbol} | notional={actual_notional} "
+                f"OPEN BLOCK MARGIN | {strategy_id} | {symbol} | notional={actual_notional} "
                 f"effective_lev={effective_leverage}x margin={effective_margin} free={free_margin}"
             )
             return None
@@ -1936,7 +2063,7 @@ class ExecutionEngine:
             qty = floor_step(qty, step)
             if qty <= 0:
                 logger.warning(
-                    f"CLOSE LEG SKIP V15 | {strategy_id} | {symbol} {leg.get('side')} | wanted={wanted} physical_available={physical} | "
+                    f"CLOSE LEG SKIP | {strategy_id} | {symbol} {leg.get('side')} | wanted={wanted} physical_available={physical} | "
                     "motivo=POSICAO_FISICA_JA_ENCERRADA_OU_RESERVADA_PARA_OUTRA_ESTRATEGIA"
                 )
                 return None
@@ -2142,18 +2269,18 @@ class ExecutionEngine:
             except Exception as e:
                 logger.warning(f"CANCEL BASKET EXIT FAIL | {symbol} | {cid} | {e}")
 
-    def basket_exit_is_live(self, symbol: str, native_exit: Optional[Dict[str, Any]]) -> bool:
+    def basket_exit_health(self, symbol: str, native_exit: Optional[Dict[str, Any]]) -> str:
         if not native_exit:
-            return False
+            return "MISSING"
         if not LIVE_TRADING:
-            return True
+            return "LIVE"
         expected = [str(x.get("client_id") or "") for x in native_exit.get("orders", []) if x.get("client_id")]
         if not expected:
-            return False
+            return "MISSING"
         try:
             rows = self.client.open_orders(symbol)
             if not isinstance(rows, list):
-                return False
+                return "UNKNOWN"
             live_cids = {
                 str(r.get("clientOrderId") or r.get("origClientOrderId") or "")
                 for r in rows
@@ -2161,12 +2288,15 @@ class ExecutionEngine:
             }
             missing = [cid for cid in expected if cid not in live_cids]
             if missing:
-                logger.warning(f"NATIVE BASKET EXIT AUSENTE | {symbol} | missing={missing} | esperado={expected}")
-                return False
-            return True
+                logger.warning("NATIVE BASKET EXIT AUSENTE | %s | missing=%s esperado=%s", symbol, missing, expected)
+                return "MISSING"
+            return "LIVE"
         except Exception as e:
-            logger.warning(f"NATIVE BASKET EXIT VERIFY FAIL | {symbol} | {e}")
-            return True
+            logger.warning("NATIVE BASKET EXIT VERIFY UNKNOWN | %s | %s", symbol, e)
+            return "UNKNOWN"
+
+    def basket_exit_is_live(self, symbol: str, native_exit: Optional[Dict[str, Any]]) -> bool:
+        return self.basket_exit_health(symbol, native_exit) == "LIVE"
 
     def consume_basket_exit(self, strategy_id: str, symbol: str, legs: List[Dict[str, Any]],
                             native_exit: Optional[Dict[str, Any]], ref_price: Decimal,
@@ -2377,7 +2507,7 @@ class RangeEngine:
             if keep <= 0:
                 changed = True
                 logger.warning(
-                    f"RANGE GHOST LEG REMOVIDA V15 | {self.symbol} | side={side} leg={leg.get('id')} virtual_qty={qty} "
+                    f"RANGE GHOST LEG REMOVIDA | {self.symbol} | side={side} leg={leg.get('id')} virtual_qty={qty} "
                     f"physical_capacity={by_side_capacity[side]} reserved_other={self._other_strategy_reserved_qty(side)}"
                 )
                 continue
@@ -2388,7 +2518,7 @@ class RangeEngine:
                 new_leg["notional"] = str(keep * dec(new_leg.get("entry_price")))
                 leg = new_leg
                 logger.warning(
-                    f"RANGE GHOST LEG REDUZIDA V15 | {self.symbol} | side={side} leg={leg.get('id')} old_qty={qty} new_qty={keep}"
+                    f"RANGE GHOST LEG REDUZIDA | {self.symbol} | side={side} leg={leg.get('id')} old_qty={qty} new_qty={keep}"
                 )
             rebuilt.append(leg)
             used[side] += keep
@@ -2413,7 +2543,7 @@ class RangeEngine:
             self.store.save()
             release_owner(self.store, self.symbol, self.id)
             logger.warning(
-                f"RANGE BASKET RECONCILIADO V15 | {self.symbol} | nenhuma quantidade RANGE restante na Aster | "
+                f"RANGE BASKET RECONCILIADO | {self.symbol} | nenhuma quantidade RANGE restante na Aster | "
                 f"status={st['status']} equity_preservada={st.get('equity')} RD_preservado={st.get('recovery_deficit')}"
             )
             return True
@@ -2479,7 +2609,7 @@ class RangeEngine:
         requested = max(dynamic_notional, classic_floor)
         capped = min(requested, configured_max_recovery_notional(self.symbol))
         if capped < requested:
-            logger.warning(f"RANGE DYNAMIC RECOVERY CAPPED V15 | {self.symbol} | requested={requested} cap={capped} level={recovery_level}")
+            logger.warning(f"RANGE DYNAMIC RECOVERY CAPPED | {self.symbol} | requested={requested} cap={capped} level={recovery_level}")
         return capped, tp_price, existing_at_tp
 
     def _open(self, side: str, price: Decimal, target_profit: Optional[Decimal], reason: str,
@@ -2494,10 +2624,10 @@ class RangeEngine:
             return None
         gate_ok, gate_reason = self.store.entry_allowed()
         if not gate_ok:
-            logger.warning(f"RANGE ENTRY GATE V15 | {self.symbol} | {gate_reason}")
+            logger.warning(f"RANGE ENTRY GATE | {self.symbol} | {gate_reason}")
             return None
         if not self.md.is_fresh(self.symbol):
-            logger.warning(f"RANGE ENTRY STALE PRICE V15 | {self.symbol} | age_s={self.md.age(self.symbol):.3f}")
+            logger.warning(f"RANGE ENTRY STALE PRICE | {self.symbol} | age_s={self.md.age(self.symbol):.3f}")
             return None
         if not acquire_owner(self.store, self.symbol, self.id):
             logger.info(f"RANGE BLOQUEADO OWNER | {self.symbol} | owner={self.store.state['symbol_owner'].get(self.symbol)}")
@@ -2584,7 +2714,7 @@ class RangeEngine:
         _apply_realized_pnl_to_state(st, pnl, price, reason)
         rd_after = dec(st.get("recovery_deficit"))
 
-        # V24: um martingale RANGE só é considerado ACERTO quando o PnL REALIZADO
+        # Um martingale RANGE legado só é considerado ACERTO quando o PnL REALIZADO
         # cobriu integralmente o déficit anterior. Nesse caso o estado operacional
         # é zerado explicitamente; não dependemos de estado legado/migração.
         recovery_success = recovery_attempt and recovery_tp_hit and rd_before > 0 and pnl >= rd_before
@@ -2598,7 +2728,7 @@ class RangeEngine:
             st["last_result"] = "RECOVERY_WIN_RESET"
             protect_after = False
             logger.warning(
-                f"RANGE RECOVERY RESET V24 | {self.symbol} | pnl_realizado={pnl} "
+                f"RANGE RECOVERY RESET | {self.symbol} | pnl_realizado={pnl} "
                 f"rd_before={rd_before} -> RD=0 failures=0 status=IDLE anchor={price}"
             )
         else:
@@ -2609,7 +2739,7 @@ class RangeEngine:
                 protect_after = True
                 st["last_result"] = "RECOVERY_PARTIAL"
                 logger.warning(
-                    f"RANGE RECOVERY PARTIAL V24 | {self.symbol} | pnl_realizado={pnl} "
+                    f"RANGE RECOVERY PARTIAL | {self.symbol} | pnl_realizado={pnl} "
                     f"rd_before={rd_before} rd_restante={rd_after} | mantendo recovery"
                 )
             if protect_after:
@@ -2626,7 +2756,7 @@ class RangeEngine:
         self.store.save()
         release_owner(self.store, self.symbol, self.id)
         logger.info(
-            f"RANGE CLOSE V24 | {self.symbol} | reason={reason} pnl={pnl} equity={st['equity']} "
+            f"RANGE CLOSE | {self.symbol} | reason={reason} pnl={pnl} equity={st['equity']} "
             f"RD={st['recovery_deficit']} recovery_success={recovery_success} protect={protect_after}"
         )
 
@@ -2640,7 +2770,7 @@ class RangeEngine:
         b = st.get("basket")
         if b:
             logger.warning(
-                f"RANGE RETIRE V27 | {self.symbol} | fechando somente lotes RANGE legados; "
+                f"RANGE RETIRE | {self.symbol} | fechando somente lotes RANGE legados; "
                 f"legs={len(b.get('legs', []) or [])}"
             )
             self._close_basket(price, "MIGRATION_RETIRE_RANGE_V28", protect_after=False)
@@ -2657,7 +2787,7 @@ class RangeEngine:
         st["last_update"] = now_iso()
         self.store.save()
         release_owner(self.store, self.symbol, self.id)
-        logger.warning(f"RANGE RETIRED V28 | {self.symbol} | novas_entradas=DESABILITADAS_PERMANENTEMENTE")
+        logger.warning(f"RANGE RETIRED | {self.symbol} | novas_entradas=DESABILITADAS_PERMANENTEMENTE")
 
     def _reverse(self, price: Decimal) -> None:
         st = self.st(); b = st.get("basket")
@@ -2723,7 +2853,7 @@ class RangeEngine:
         except Exception as e:
             b["native_basket_stop"] = None
             logger.exception(f"RANGE NATIVE BASKET SL FAIL | {self.symbol} | {e}")
-        logger.warning(f"RANGE RECOVERY PROTECTION V15 | {self.symbol} | TP={recovery_tp} SL={recovery_stop} | native_tp={bool(b.get('native_basket_exit'))} native_sl={bool(b.get('native_basket_stop'))}")
+        logger.warning(f"RANGE RECOVERY PROTECTION | {self.symbol} | TP={recovery_tp} SL={recovery_stop} | native_tp={bool(b.get('native_basket_exit'))} native_sl={bool(b.get('native_basket_stop'))}")
         st["last_update"] = now_iso()
         self.store.save()
         logger.warning(f"RANGE REVERSE 4X DINAMICO | {self.symbol} | new={new_side} @{recovery_entry} | mtm={mtm} existing_at_tp={existing_at_tp} desired_notional={desired_notional} recovery_tp={recovery_tp} failures={st['failures']}")
@@ -2817,7 +2947,7 @@ class RangeEngine:
                         tol = max(tick * D(2), _re * D("0.000001"))
                         if abs(stored_rtp - expected_rtp) > tol or abs(stored_rsl - expected_rsl) > tol:
                             logger.warning(
-                                f"RANGE RECOVERY PRICE MIGRATION V15 | {self.symbol} | side={active_recovery_side} entry={_re} | old_tp={stored_rtp} old_sl={stored_rsl} -> new_tp={expected_rtp} new_sl={expected_rsl}"
+                                f"RANGE RECOVERY PRICE MIGRATION | {self.symbol} | side={active_recovery_side} entry={_re} | old_tp={stored_rtp} old_sl={stored_rsl} -> new_tp={expected_rtp} new_sl={expected_rsl}"
                             )
                             self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
                             self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
@@ -2846,7 +2976,7 @@ class RangeEngine:
                     st["protect_anchor"] = None
                     self.store.save()
                     release_owner(self.store, self.symbol, self.id)
-                    logger.info(f"RANGE NATIVE BASKET TP CLOSE V15 | {self.symbol} | pnl={pnl} equity={st['equity']} RD={st['recovery_deficit']}")
+                    logger.info(f"RANGE NATIVE BASKET TP CLOSE | {self.symbol} | pnl={pnl} equity={st['equity']} RD={st['recovery_deficit']}")
                     return
                 native_stop = None
                 if b.get("native_basket_stop"):
@@ -2865,7 +2995,7 @@ class RangeEngine:
                     st["anchor"] = str(price)
                     self.store.save()
                     release_owner(self.store, self.symbol, self.id)
-                    logger.warning(f"RANGE NATIVE BASKET SL CLOSE V15 | {self.symbol} | pnl={pnl} equity={st['equity']} RD={st['recovery_deficit']}")
+                    logger.warning(f"RANGE NATIVE BASKET SL CLOSE | {self.symbol} | pnl={pnl} equity={st['equity']} RD={st['recovery_deficit']}")
                     return
                 if self._reconcile_range_ghost_legs(b, price):
                     return
@@ -2889,7 +3019,7 @@ class RangeEngine:
                             self.id + ":TP", self.symbol, b.get("legs", []), rtp, price
                         )
                         self.store.save()
-                        logger.warning(f"RANGE BASKET TP REINSTALADO V15 | {self.symbol} | trigger={rtp}")
+                        logger.warning(f"RANGE BASKET TP REINSTALADO | {self.symbol} | trigger={rtp}")
                     except Exception as e:
                         logger.exception(f"RANGE BASKET TP REINSTALL FAIL | {self.symbol} | {e}")
                 if rsl > 0 and not b.get("native_basket_stop") and NATIVE_PROTECTIVE_ORDERS:
@@ -2898,7 +3028,7 @@ class RangeEngine:
                             self.id + ":SL", self.symbol, b.get("legs", []), rsl, price
                         )
                         self.store.save()
-                        logger.warning(f"RANGE BASKET SL REINSTALADO V15 | {self.symbol} | trigger={rsl}")
+                        logger.warning(f"RANGE BASKET SL REINSTALADO | {self.symbol} | trigger={rsl}")
                     except Exception as e:
                         logger.exception(f"RANGE BASKET SL REINSTALL FAIL | {self.symbol} | {e}")
                 if rtp > 0 and ((active == "LONG" and price >= rtp) or (active == "SHORT" and price <= rtp)):
@@ -2918,7 +3048,7 @@ class PyramidEngine:
     """Escada direcional persistente baseada exclusivamente em deslocamentos de 1% do anchor.
 
     LONG: +1%, +2%, +3% ...; SHORT: -1%, -2%, -3% ...
-    V28 separa contabilidade lógica de capacidade física:
+    A arquitetura atual separa contabilidade lógica de capacidade física:
       - nível 1 usa PYRAMID_INITIAL_NOTIONAL_USD;
       - níveis seguintes usam uma fração da MARGEM FÍSICA LIVRE REAL da conta
         (availableBalance - MIN_FREE_WALLET_BUFFER_USD), convertida em notional
@@ -2945,6 +3075,7 @@ class PyramidEngine:
         self.id = f"PYRAMID:{symbol}:{self.side}" if grid_id == "LEGACY" else f"PYRAMID:{symbol}:{self.side}:{grid_id}"
         self.client = client; self.md = md; self.news = news
         self.account = account; self.exe = exe; self.store = store
+        self._last_native_stop_refresh = 0.0
 
     def st(self) -> Dict[str, Any]:
         return self.store.state[self.state_bucket][self.state_key]
@@ -3002,12 +3133,12 @@ class PyramidEngine:
         actual_notional = qty * price
         margin = actual_notional / D(lev)
         if margin > free:
-            logger.warning(f"PYRAMID MARGIN BLOCK V28 | {self.id} | level={level} margin={margin} free={free}")
+            logger.warning(f"PYRAMID MARGIN BLOCK | {self.id} | level={level} margin={margin} free={free}")
             return None
         current_symbol = self.account.current_symbol_notional(self.symbol)
         symbol_cap = configured_max_total_symbol_notional(self.symbol)
         if current_symbol + actual_notional > symbol_cap:
-            logger.warning(f"PYRAMID SYMBOL CAP V28 | {self.id} | current={current_symbol} add={actual_notional} cap={symbol_cap}")
+            logger.warning(f"PYRAMID SYMBOL CAP | {self.id} | current={current_symbol} add={actual_notional} cap={symbol_cap}")
             return None
         return {"leverage": lev, "qty": qty, "price": price, "notional": actual_notional,
                 "margin": margin, "estimated_adverse_loss": D(0), "target_profit": D(0),
@@ -3026,16 +3157,283 @@ class PyramidEngine:
             return False
         gate_ok, gate_reason = self.store.entry_allowed()
         if not gate_ok:
-            logger.warning(f"PYRAMID ENTRY GATE V28 | {self.id} | {gate_reason}")
+            logger.warning(f"PYRAMID ENTRY GATE | {self.id} | {gate_reason}")
             return False
         if not self.md.is_fresh(self.symbol):
-            logger.warning(f"PYRAMID STALE PRICE V28 | {self.id} | age_s={self.md.age(self.symbol):.3f}")
+            logger.warning(f"PYRAMID STALE PRICE | {self.id} | age_s={self.md.age(self.symbol):.3f}")
             return False
         if PYRAMID_APPLY_NEWS_FILTER:
             blocked, why = self.news.blocked()
             if blocked:
                 logger.info(f"PYRAMID NEWS BLOCK | {self.id} | {why}")
                 return False
+        return True
+
+    def _physical_position_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Retorna a posição física deste symbol/side para cálculo de liquidação."""
+        if not LIVE_TRADING:
+            return None
+        try:
+            rows = self.client.positions(self.symbol)
+            if not isinstance(rows, list):
+                rows = [rows] if rows else []
+            for p in rows:
+                if (
+                    str(p.get("symbol", "")).upper() == self.symbol
+                    and str(p.get("positionSide", "")).upper() == self.side
+                    and abs(dec(p.get("positionAmt"))) > 0
+                ):
+                    return p
+        except Exception as exc:
+            logger.warning(f"PYRAMID NATIVE STOP POSITION SNAPSHOT FAIL | {self.id} | {exc}")
+        return None
+
+    def _max_loss_stop_price(self) -> Optional[Decimal]:
+        """Preço em que o PnL líquido estimado atinge -PYRAMID_MAX_LOSS_USD.
+
+        Usa a mesma taxa de fee do _net_unrealized() para que a ordem nativa fique
+        coerente com o limite lógico do PYRAMID.
+        """
+        st = self.st()
+        legs = st.get("legs", []) or []
+        if not legs:
+            return None
+        q_total = D(0)
+        entry_value = D(0)
+        for leg in legs:
+            q = dec(leg.get("qty"))
+            ep = dec(leg.get("entry_price"))
+            if q > 0 and ep > 0:
+                q_total += q
+                entry_value += ep * q
+        if q_total <= 0 or entry_value <= 0:
+            return None
+
+        share = dec(st.get("capital_share", "1"))
+        max_loss = PYRAMID_MAX_LOSS_USD * share
+        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
+
+        if self.side == "LONG":
+            denom = q_total * (D(1) - fee_rate)
+            if denom <= 0:
+                return None
+            raw = (entry_value * (D(1) + fee_rate) - max_loss) / denom
+        else:
+            denom = q_total * (D(1) + fee_rate)
+            if denom <= 0:
+                return None
+            raw = (entry_value * (D(1) - fee_rate) + max_loss) / denom
+
+        if raw <= 0:
+            return None
+        direction = "DOWN" if self.side == "LONG" else "UP"
+        return self.exe.rules.trigger_price(self.symbol, raw, direction)
+
+    def _effective_native_stop_price(self, mark: Decimal) -> Tuple[Optional[Decimal], Dict[str, Any]]:
+        """Combina max-loss lógico com buffer antes da liquidação física.
+
+        LONG: escolhe o stop MAIS ALTO (fecha antes).
+        SHORT: escolhe o stop MAIS BAIXO (fecha antes).
+        """
+        loss_stop = self._max_loss_stop_price()
+        physical = self._physical_position_snapshot()
+        liq = dec((physical or {}).get("liquidationPrice"))
+        liq_guard = None
+
+        if liq > 0:
+            if self.side == "LONG":
+                raw = liq * (D(1) + LIQUIDATION_BUFFER_PCT)
+                liq_guard = self.exe.rules.trigger_price(self.symbol, raw, "DOWN")
+            else:
+                raw = liq * (D(1) - LIQUIDATION_BUFFER_PCT)
+                liq_guard = self.exe.rules.trigger_price(self.symbol, raw, "UP")
+
+        candidates = [x for x in (loss_stop, liq_guard) if x is not None and x > 0]
+        if not candidates:
+            return None, {"loss_stop": loss_stop, "liq": liq, "liq_guard": liq_guard}
+
+        target = max(candidates) if self.side == "LONG" else min(candidates)
+
+        # A ordem deve estar no lado adverso do mark. Se já estivermos além do
+        # preço seguro, o tick fará fechamento imediato em vez de instalar
+        # uma condicional inválida.
+        valid = target < mark if self.side == "LONG" else target > mark
+        return (target if valid else None), {
+            "loss_stop": loss_stop,
+            "liq": liq,
+            "liq_guard": liq_guard,
+            "target": target,
+            "mark": mark,
+            "valid": valid,
+        }
+
+    def _clear_native_risk_stop(self) -> None:
+        st = self.st()
+        native = st.get("native_risk_stop")
+        if native:
+            self.exe.cancel_basket_exit(self.symbol, native)
+        st["native_risk_stop"] = None
+
+    def _stop_state_after_close(self, total: Decimal, net_before_close: Decimal,
+                                reason: str, remaining: List[Dict[str, Any]]) -> None:
+        st = self.st()
+        st["legs"] = remaining
+        st["realized_pnl"] = str(dec(st.get("realized_pnl")) + total)
+        st["equity"] = str(
+            PYRAMID_BANKROLL_USD * dec(st.get("capital_share", "1"))
+            + dec(st.get("realized_pnl"))
+        )
+        st["last_unrealized"] = "0"
+        st["last_net_pnl"] = str(total)
+        st["native_risk_stop"] = None
+        st["stopped"] = bool(PYRAMID_STOP_AFTER_MAX_LOSS)
+        st["stop_reason"] = (
+            f"{reason} net_before_close={net_before_close} realized_close={total}"
+        )
+        st["last_update"] = now_iso()
+        self.store.save()
+
+    def _consume_native_risk_stop(self, price: Decimal) -> bool:
+        st = self.st()
+        native = st.get("native_risk_stop")
+        legs = list(st.get("legs", []) or [])
+        if not native or not legs:
+            return False
+        try:
+            consumed = self.exe.consume_basket_exit(
+                self.id,
+                self.symbol,
+                legs,
+                native,
+                price,
+                "NATIVE_PYRAMID_RISK_STOP_V29",
+            )
+        except Exception as exc:
+            logger.exception(f"PYRAMID NATIVE STOP CONSUME FAIL | {self.id} | {exc}")
+            return False
+
+        if not consumed:
+            return False
+
+        total, closes = consumed
+        closed_ids = {str(c.get("leg_id")) for c in closes}
+        remaining = [leg for leg in legs if str(leg.get("id")) not in closed_ids]
+        net_before = dec(st.get("last_net_pnl"))
+        self._stop_state_after_close(
+            total, net_before, "NATIVE_RISK_STOP_FILLED", remaining
+        )
+        logger.critical(
+            f"PYRAMID NATIVE RISK STOP FILLED | {self.id} | "
+            f"realized={total} remaining_legs={len(remaining)} stopped={self.st().get('stopped')}"
+        )
+        return True
+
+    def _ensure_native_risk_stop(self, price: Decimal, force: bool = False) -> bool:
+        """Mantém uma STOP_MARKET nativa para a cesta PYRAMID deste lado."""
+        if not PYRAMID_NATIVE_RISK_STOP or not NATIVE_PROTECTIVE_ORDERS:
+            return True
+
+        st = self.st()
+        legs = list(st.get("legs", []) or [])
+        if not legs:
+            if st.get("native_risk_stop"):
+                self._clear_native_risk_stop()
+                self.store.save()
+            return True
+
+        now_t = time.time()
+        if (
+            not force
+            and now_t - self._last_native_stop_refresh < max(1.0, PYRAMID_NATIVE_STOP_REFRESH_SECONDS)
+        ):
+            return True
+        self._last_native_stop_refresh = now_t
+
+        target, meta = self._effective_native_stop_price(price)
+        existing = st.get("native_risk_stop")
+
+        # Se a proteção atual continua viva e o alvo não mudou materialmente,
+        # não cancela/recria a ordem.
+        if existing and target is not None:
+            old_target = dec(existing.get("target_price"))
+            tick = self.exe.rules.rules[self.symbol].tick_size
+            health = self.exe.basket_exit_health(self.symbol, existing)
+            if health == "UNKNOWN":
+                self.store.set_protection_block(self.id, "PYRAMID_NATIVE_STOP_VERIFY_UNKNOWN")
+                logger.error(
+                    "PYRAMID NATIVE STOP VERIFY UNKNOWN | %s | mantendo ordem persistida e bloqueando novas entradas",
+                    self.id,
+                )
+                return False
+            if (
+                old_target > 0
+                and abs(old_target - target) <= max(tick, tick * D(2))
+                and health == "LIVE"
+            ):
+                self.store.set_protection_block(self.id, None)
+                return True
+
+        # Se o preço já ultrapassou a faixa em que uma condicional seria válida,
+        # fecha agora para não esperar liquidação.
+        if target is None:
+            candidate = dec(meta.get("target"))
+            liq = dec(meta.get("liq"))
+            unsafe = (
+                candidate > 0
+                and (
+                    (self.side == "LONG" and price <= candidate)
+                    or (self.side == "SHORT" and price >= candidate)
+                )
+            )
+            if unsafe:
+                logger.critical(
+                    f"PYRAMID LIQUIDATION GUARD IMMEDIATE | {self.id} | "
+                    f"mark={price} candidate_stop={candidate} liq={liq} meta={meta}"
+                )
+                self._clear_native_risk_stop()
+                net = self._net_unrealized(price)
+                self._stop_and_close(price, net, close_reason="PYRAMID_LIQUIDATION_GUARD_V29")
+                return False
+            logger.warning(
+                f"PYRAMID NATIVE STOP TARGET UNAVAILABLE | {self.id} | meta={meta}"
+            )
+            return False
+
+        if existing:
+            self.exe.cancel_basket_exit(self.symbol, existing)
+            st["native_risk_stop"] = None
+
+        try:
+            native = self.exe.install_basket_exit(
+                self.id, self.symbol, legs, target, price
+            )
+        except Exception as exc:
+            logger.exception(
+                f"PYRAMID NATIVE STOP INSTALL FAIL | {self.id} | target={target} | {exc}"
+            )
+            self.store.set_protection_block(self.id, "PYRAMID_NATIVE_STOP_INSTALL_FAILED")
+            return False
+
+        if not native:
+            logger.warning(
+                f"PYRAMID NATIVE STOP NOT INSTALLED | {self.id} | target={target}"
+            )
+            self.store.set_protection_block(self.id, "PYRAMID_NATIVE_STOP_NOT_INSTALLED")
+            return False
+
+        native["risk_meta"] = {
+            k: (str(v) if isinstance(v, Decimal) else v) for k, v in meta.items()
+        }
+        st["native_risk_stop"] = native
+        st["last_update"] = now_iso()
+        self.store.set_protection_block(self.id, None)
+        self.store.save()
+        logger.warning(
+            f"PYRAMID NATIVE RISK STOP | {self.id} | side={self.side} "
+            f"target={target} max_loss_stop={meta.get('loss_stop')} "
+            f"liq={meta.get('liq')} liq_guard={meta.get('liq_guard')} "
+            f"qty={sum((dec(x.get('qty')) for x in legs), D(0))}"
+        )
         return True
 
     def _open_level(self, price: Decimal, level: int, trigger: Decimal) -> bool:
@@ -3056,30 +3454,46 @@ class PyramidEngine:
         st["last_update"] = now_iso()
         self.store.save()
         logger.warning(
-            f"PYRAMID OPEN V28 | {self.id} | level={level} trigger={trigger} fill={leg.get('entry_price')} "
+            f"PYRAMID OPEN | {self.id} | level={level} trigger={trigger} fill={leg.get('entry_price')} "
             f"qty={leg.get('qty')} notional={leg.get('notional')} leverage={sizing['leverage']}x "
             f"anchor={st.get('anchor')} next_level={st['next_level']}"
         )
+        # Recalcula a proteção porque quantidade/entry médio/liquidação mudaram.
+        # Se a ordem protetiva não puder ser mantida, preserva o nível que acabou
+        # de abrir, mas impede qualquer nova adição neste mesmo tick.
+        protected = self._ensure_native_risk_stop(price, force=True)
+        if not protected:
+            logger.critical(
+                f"PYRAMID PROTECTION INSTALL FAIL | {self.id} | level={level} "
+                f"motivo=NATIVE_RISK_STOP_NOT_CONFIRMED | fechando cesta para nao manter exposicao desprotegida"
+            )
+            net = self._net_unrealized(price)
+            self._stop_and_close(
+                price,
+                net,
+                close_reason="PYRAMID_PROTECTION_INSTALL_FAILED",
+            )
+            return False
         return True
 
-    def _stop_and_close(self, price: Decimal, net_before_close: Decimal) -> None:
+    def _stop_and_close(self, price: Decimal, net_before_close: Decimal, close_reason: str = "PYRAMID_MAX_LOSS") -> None:
         st = self.st()
         legs = list(st.get("legs", []) or [])
+        self._clear_native_risk_stop()
         if not legs:
-            st["stopped"] = True; st["stop_reason"] = "MAX_LOSS"; self.store.save(); return
-        total, closes = self.exe.close_legs(self.id, self.symbol, legs, price, "PYRAMID_MAX_LOSS")
+            st["stopped"] = True
+            st["stop_reason"] = close_reason
+            self.store.save()
+            return
+        total, closes = self.exe.close_legs(self.id, self.symbol, legs, price, close_reason)
         closed_ids = {str(c.get("leg_id")) for c in closes}
         remaining = [leg for leg in legs if str(leg.get("id")) not in closed_ids]
-        st["legs"] = remaining
-        st["realized_pnl"] = str(dec(st.get("realized_pnl")) + total)
-        st["equity"] = str(PYRAMID_BANKROLL_USD * dec(st.get("capital_share", "1")) + dec(st.get("realized_pnl")))
-        st["last_unrealized"] = "0"
-        st["last_net_pnl"] = str(total)
-        st["stopped"] = bool(PYRAMID_STOP_AFTER_MAX_LOSS)
-        st["stop_reason"] = f"MAX_LOSS_REACHED net_before_close={net_before_close} realized_close={total}"
-        st["last_update"] = now_iso()
-        self.store.save()
-        logger.critical(f"PYRAMID STOP V28 | {self.id} | net_before_close={net_before_close} realized={total} remaining_legs={len(remaining)} stopped={st['stopped']}")
+        self._stop_state_after_close(total, net_before_close, close_reason, remaining)
+        logger.critical(
+            f"PYRAMID STOP | {self.id} | reason={close_reason} "
+            f"net_before_close={net_before_close} realized={total} "
+            f"remaining_legs={len(remaining)} stopped={self.st().get('stopped')}"
+        )
 
     def diagnostic(self, price: Optional[Decimal]) -> Dict[str, Any]:
         """Retorna o motivo operacional atual para não haver nova entrada."""
@@ -3129,11 +3543,19 @@ class PyramidEngine:
             st["next_level"] = max(1, int(st.get("next_level", 1)))
             st["last_update"] = now_iso()
             self.store.save()
-            logger.warning(f"PYRAMID ANCHOR V28 | {self.id} | phase={self.grid_phase} anchor={st['anchor']} | first_trigger={self._trigger_price(dec(st['anchor']), 1)}")
+            logger.warning(f"PYRAMID ANCHOR | {self.id} | phase={self.grid_phase} anchor={st['anchor']} | first_trigger={self._trigger_price(dec(st['anchor']), 1)}")
             return
 
         legs = st.get("legs", []) or []
         if legs:
+            # A ordem STOP_MARKET vive na exchange. No tick, primeiro consumimos
+            # eventual fill e depois verificamos/recriamos a proteção se necessário.
+            if self._consume_native_risk_stop(price):
+                return
+            if not self._ensure_native_risk_stop(price):
+                # Se não foi possível manter a proteção nativa, não abre novos níveis
+                # neste tick; a posição existente continua sob o watchdog lógico.
+                return
             net = self._net_unrealized(price)
             st["last_unrealized"] = str(net)
             st["last_net_pnl"] = str(dec(st.get("realized_pnl")) + net)
@@ -3162,6 +3584,7 @@ class Reconciler:
     def __init__(self, client: AsterClient, store: StateStore, ledger: FillLedger, rules: RulesBook):
         self.client = client; self.store = store; self.ledger = ledger; self.rules = rules
         self.last_snapshot: Optional[ExchangeSnapshot] = None
+        self._state_ledger_mismatch_streak = 0
 
     def snapshot(self) -> ExchangeSnapshot:
         positions: Dict[Tuple[str, str], Decimal] = {}; entries: Dict[Tuple[str, str], Decimal] = {}
@@ -3178,6 +3601,49 @@ class Reconciler:
 
     def expected_by_symbol_side(self) -> Dict[Tuple[str, str], Decimal]:
         return self.ledger.open_by_symbol_side()
+
+    def expected_from_state_by_symbol_side(self) -> Dict[Tuple[str, str], Decimal]:
+        out: Dict[Tuple[str, str], Decimal] = {}
+
+        def add(symbol: str, side: str, qty: Any) -> None:
+            sym = str(symbol).upper()
+            ps = str(side).upper()
+            q = dec(qty)
+            if sym in SYMBOLS and ps in ("LONG", "SHORT") and q > 0:
+                out[(sym, ps)] = out.get((sym, ps), D(0)) + q
+
+        with self.store.lock:
+            # Active single-PYRAMID states.
+            for st in self.store.state.get("pyramid", {}).values():
+                if not isinstance(st, dict):
+                    continue
+                sym = str(st.get("symbol") or "").upper()
+                default_side = str(st.get("side") or "").upper()
+                for leg in st.get("legs", []) or []:
+                    add(sym, leg.get("side") or default_side, leg.get("qty"))
+
+            # Compatibility/drain-only G0 states, only if they still carry live legs.
+            for st in self.store.state.get("pyramid_grids", {}).values():
+                if not isinstance(st, dict):
+                    continue
+                sym = str(st.get("symbol") or "").upper()
+                default_side = str(st.get("side") or "").upper()
+                for leg in st.get("legs", []) or []:
+                    add(sym, leg.get("side") or default_side, leg.get("qty"))
+
+        return out
+
+    def state_ledger_mismatches(self, ledger_expected: Dict[Tuple[str, str], Decimal]
+                                ) -> List[Tuple[Tuple[str, str], Decimal, Decimal]]:
+        state_expected = self.expected_from_state_by_symbol_side()
+        out: List[Tuple[Tuple[str, str], Decimal, Decimal]] = []
+        for key in set(ledger_expected) | set(state_expected):
+            lq = ledger_expected.get(key, D(0))
+            sq = state_expected.get(key, D(0))
+            step = self.rules.rules[key[0]].step_size if key[0] in self.rules.rules else D("0.00000001")
+            if abs(lq - sq) >= step:
+                out.append((key, lq, sq))
+        return out
 
     def reconcile(self) -> bool:
         if not LIVE_TRADING:
@@ -3215,11 +3681,11 @@ class Reconciler:
                     step = self.rules.rules[k[0]].step_size if k[0] in self.rules.rules else D("0.00000001")
                     if abs(e - a) >= step:
                         mismatches.append((k, e, a))
-                logger.warning(f"RECONCILE V21 | AUTO_REPAIR_RANGE_GHOST | repaired={repaired} remaining={mismatches}")
+                logger.warning(f"RECONCILE | AUTO_REPAIR_RANGE_GHOST | repaired={repaired} remaining={mismatches}")
                 if not mismatches:
                     self.store.set_trade_gate(True, None)
                     cleared = self.store.clear_soft_position_mismatch()
-                    logger.info(f"RECONCILE V21 | OK APOS AUTO-REPAIR | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
+                    logger.info(f"RECONCILE | OK APOS AUTO-REPAIR | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
                     return True
 
         if mismatches:
@@ -3229,11 +3695,29 @@ class Reconciler:
             desired = "HARD" if HARD_KILL_ON_POSITION_MISMATCH else "SOFT"
             if str(current_ks.get("mode")) != desired or str(current_ks.get("reason")) != reason:
                 self.store.kill(desired, reason)
-            logger.error(f"RECONCILE V21 | BLOQUEADO | {reason}")
+            logger.error(f"RECONCILE | BLOQUEADO | {reason}")
             return False
+        state_mismatches = self.state_ledger_mismatches(expected)
+        if state_mismatches:
+            self._state_ledger_mismatch_streak += 1
+            logger.error(
+                "RECONCILE | STATE_LEDGER_MISMATCH | streak=%s/%s | ledger_vs_state=%s | physical=%s",
+                self._state_ledger_mismatch_streak,
+                max(1, STATE_LEDGER_MISMATCH_CONFIRMATIONS),
+                state_mismatches,
+                actual,
+            )
+            if self._state_ledger_mismatch_streak >= max(1, STATE_LEDGER_MISMATCH_CONFIRMATIONS):
+                self.store.set_trade_gate(False, f"STATE_LEDGER_MISMATCH:{state_mismatches}")
+            return False
+
+        self._state_ledger_mismatch_streak = 0
         self.store.set_trade_gate(True, None)
         cleared = self.store.clear_soft_position_mismatch()
-        logger.info(f"RECONCILE V21 | OK | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
+        logger.info(
+            "RECONCILE | OK | ledger=%s state=%s physical=%s | soft_mismatch_cleared=%s",
+            expected, self.expected_from_state_by_symbol_side(), actual, cleared,
+        )
         return True
 
 # -----------------------------------------------------------------------------
@@ -3241,6 +3725,10 @@ class Reconciler:
 # -----------------------------------------------------------------------------
 
 def run_internal_regression_checks() -> None:
+    assert STATE_LEDGER_MISMATCH_CONFIRMATIONS >= 1
+    assert UNKNOWN_ORDER_QUERY_ATTEMPTS >= 1
+    assert PYRAMID_MAX_EFFECTIVE_LEVERAGE >= MIN_LEVERAGE
+    assert PYRAMID_MAX_EFFECTIVE_LEVERAGE <= PYRAMID_LEVERAGE
     assert RANGE_SIGNAL_MODE == "VOLATILITY_ONLY"
     assert RANGE_ENGINE_ENABLED is False
     assert PYRAMID_GRID_PHASES == (D("0"),)
@@ -3259,8 +3747,9 @@ def run_internal_regression_checks() -> None:
     assert PYRAMID_BTC_MIN_ADD_NOTIONAL_USD > 0
     assert PYRAMID_STEP_PCT > 0 and D(0) < PYRAMID_ADD_FREE_MARGIN_PCT <= D(1)
     assert PYRAMID_LEVERAGE >= 1 and PYRAMID_MAX_LOSS_USD > 0
+    assert PYRAMID_NATIVE_STOP_REFRESH_SECONDS >= 1
 
-    # V24 regression: realized PnL must clear RD exactly when it covers prior loss.
+    # Regression: realized PnL must clear RD exactly when it covers prior loss.
     _t = {"equity":"10", "realized_pnl":"0", "recovery_deficit":"1", "wins":0, "losses":0}
     _apply_realized_pnl_to_state(_t, D("1.25"), D("100"), "TEST_RECOVERY_WIN")
     assert dec(_t["recovery_deficit"]) == D(0)
@@ -3268,7 +3757,7 @@ def run_internal_regression_checks() -> None:
     _apply_realized_pnl_to_state(_t2, D("0.75"), D("100"), "TEST_RECOVERY_PARTIAL")
     assert dec(_t2["recovery_deficit"]) == D("0.25")
     assert D("100") * D("0.05") * D("10") == D("50")
-    logger.info("SELF TEST V28 | PASS | single-pyramid/real-free-margin/range-retire/recovery/risk/tick invariants")
+    logger.info("SELF TEST | PASS | single-pyramid/real-free-margin/native-risk-stop/range-retire/recovery/risk/tick invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -3335,13 +3824,13 @@ class Bot:
                     g0["strategy"] = old_id
                     report[legacy_key] = {"status": "G0_PROMOTED", "at": now_iso()}
                     logger.warning(
-                        f"PYRAMID MIGRATION V28 | {sym} {side} | G0 -> LEGACY | "
+                        f"PYRAMID MIGRATION | {sym} {side} | G0 -> LEGACY | "
                         f"legs={len(g0_legs)} anchor={promoted.get('anchor')}"
                     )
                 elif g0_legs and legacy_legs:
                     report[legacy_key] = {"status": "DUAL_LIVE_G0_DRAIN_ONLY", "at": now_iso()}
                     logger.warning(
-                        f"PYRAMID MIGRATION V28 | {sym} {side} | LEGACY+G0 ambos possuem legs | "
+                        f"PYRAMID MIGRATION | {sym} {side} | LEGACY+G0 ambos possuem legs | "
                         f"LEGACY ativo, G0 DRAIN-ONLY; nenhuma nova entrada G0"
                     )
                 else:
@@ -3350,24 +3839,104 @@ class Bot:
 
         self.store.save()
 
+    def retire_legacy_range_positions(self) -> None:
+        """Retire only RANGE:* quantities proven by the durable FillLedger.
+
+        State is not used as ownership proof. This prevents stale/missing state.json from
+        causing the Directional robot to erase RANGE metadata while leaving physical RANGE
+        exposure behind, and prevents accidental closure of PYRAMID quantity aggregated on
+        the same symbol/positionSide.
+        """
+        if not RETIRE_LEGACY_RANGE_ON_STARTUP:
+            logger.warning("LEGACY RANGE RETIRE | DESABILITADO por configuracao")
+            return
+        if not LIVE_TRADING:
+            logger.info("LEGACY RANGE RETIRE | SKIP | LIVE_TRADING=0; nenhuma manutencao de exposicao/estado legado")
+            return
+
+        maintenance = self.store.state.setdefault("maintenance", {})
+        marker = maintenance.setdefault("legacy_range_retirement", {})
+        lots = self.ledger.open_lots_by_strategy_prefix("RANGE:")
+        if not lots:
+            marker.update({"completed": True, "completed_at": now_iso(), "reason": "NO_OPEN_RANGE_LEDGER_LOTS"})
+            self.store.state["range"] = {}
+            self.store.save()
+            logger.info("LEGACY RANGE RETIRE | nenhum lot RANGE aberto no ledger; estado legado limpo")
+            return
+
+        logger.warning("LEGACY RANGE RETIRE | encontrados=%s lots | action=CLOSE_LEDGER_OWNED_ONLY", len(lots))
+        failures: List[str] = []
+        for lot in lots:
+            strategy_id = str(lot["strategy_id"])
+            symbol = str(lot["symbol"]).upper()
+            side = str(lot["side"]).upper()
+            qty = dec(lot["qty"])
+            if symbol not in SYMBOLS or side not in ("LONG", "SHORT") or qty <= 0:
+                failures.append(f"INVALID_LOT:{strategy_id}:{symbol}:{side}:{qty}")
+                continue
+
+            positions = self.client.positions()
+            physical_qty = D(0)
+            mark = dec(lot.get("entry_price"))
+            for pos in (positions if isinstance(positions, list) else []):
+                if str(pos.get("symbol", "")).upper() == symbol and str(pos.get("positionSide", "")).upper() == side:
+                    physical_qty = abs(dec(pos.get("positionAmt")))
+                    mark = dec(pos.get("markPrice") or pos.get("entryPrice") or mark)
+                    break
+            if physical_qty <= 0:
+                self.ledger.record_close_lot(str(lot["id"]), qty)
+                logger.warning("LEGACY RANGE RETIRE | physical already flat | strategy=%s symbol=%s side=%s qty=%s | ledger zerado sem ordem",
+                               strategy_id, symbol, side, dstr(qty, 8))
+                continue
+
+            close_qty = floor_step(min(qty, physical_qty), self.rules.rules[symbol].step_size)
+            if close_qty <= 0:
+                failures.append(f"NO_CLOSABLE_QTY:{strategy_id}:{symbol}:{side}:ledger={qty}:physical={physical_qty}")
+                continue
+            leg = {"id": str(lot["id"]), "side": side, "qty": str(close_qty), "entry_price": str(dec(lot["entry_price"]))}
+            logger.warning("LEGACY RANGE RETIRE | CLOSING | strategy=%s symbol=%s side=%s ledger_qty=%s physical_qty=%s close_qty=%s",
+                           strategy_id, symbol, side, dstr(qty, 8), dstr(physical_qty, 8), dstr(close_qty, 8))
+            try:
+                rec = self.exe.close_leg(strategy_id, symbol, leg, mark, "RETIRE_LEGACY_RANGE_LEDGER_OWNED", max_physical_qty=close_qty)
+                if rec is None:
+                    failures.append(f"CLOSE_SKIPPED:{strategy_id}:{symbol}:{side}:{close_qty}")
+            except Exception as exc:
+                failures.append(f"CLOSE_FAIL:{strategy_id}:{symbol}:{side}:{exc}")
+                logger.exception("LEGACY RANGE RETIRE | CLOSE FAIL | strategy=%s symbol=%s side=%s qty=%s",
+                                 strategy_id, symbol, side, dstr(close_qty, 8))
+
+        remaining = self.ledger.open_lots_by_strategy_prefix("RANGE:")
+        marker.update({
+            "completed": not bool(remaining) and not bool(failures),
+            "last_run_at": now_iso(),
+            "remaining_open_lots": [{"strategy_id": x["strategy_id"], "symbol": x["symbol"], "side": x["side"], "qty": x["qty"]} for x in remaining],
+            "failures": failures[-20:],
+        })
+        if marker["completed"]:
+            marker["completed_at"] = now_iso()
+            self.store.state["range"] = {}
+        self.store.save()
+        if remaining or failures:
+            reason = f"LEGACY_RANGE_RETIRE_INCOMPLETE remaining={remaining} failures={failures[-5:]}"
+            self.store.set_trade_gate(False, reason)
+            logger.error("LEGACY RANGE RETIRE | INCOMPLETO | novas entradas bloqueadas | %s", reason)
+        else:
+            logger.warning("LEGACY RANGE RETIRE | CONCLUIDO | todos os lots RANGE legados encerrados; Direcional segue somente PYRAMID")
+
     def startup(self) -> None:
         logger.info("=" * 90)
         logger.info(f"{BOT_NAME} | version={VERSION} | LIVE_TRADING={LIVE_TRADING}")
-        if PYRAMID_GRID_PHASES != (D("0"),):
-            raise RuntimeError(
-                f"V28 usa uma única escada PYRAMID por símbolo/lado; PYRAMID_GRID_PHASES deve ser somente 0, atual={PYRAMID_GRID_PHASES}"
-            )
-        if len(set(PYRAMID_GRID_PHASES)) != len(PYRAMID_GRID_PHASES) or any(x < 0 or x >= PYRAMID_STEP_PCT for x in PYRAMID_GRID_PHASES):
-            raise RuntimeError(f"PYRAMID_GRID_PHASES invalidas: {PYRAMID_GRID_PHASES}; use fases unicas entre 0 e PYRAMID_STEP_PCT")
+        validate_runtime_config()
+        logger.info("CONFIG GUARD | PASS | configuracao coerente antes de rede/ordens")
         logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False (legacy positions auto-close on startup) | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} architecture=SINGLE_LONG_SHORT_PER_SYMBOL | INDICADORES=NONE")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
-        logger.info(f"BASE ETH/HYPE: bankroll={INITIAL_BANKROLL_USD} notional={INITIAL_OPERATION_NOTIONAL_USD} | BASE BTC: bankroll={BTC_INITIAL_BANKROLL_USD} notional={BTC_INITIAL_OPERATION_NOTIONAL_USD} | RANGE_RECOVERY={RECOVERY_MULTIPLIER}x | MAX_FAIL={MAX_RECOVERY_FAILURES}")
-        logger.info(f"EXITS | RANGE_TP={RANGE_TAKE_PROFIT_PCT} RANGE_STOP={RANGE_HARD_STOP_PCT} | PYRAMID_MAX_LOSS={PYRAMID_MAX_LOSS_USD}")
+        logger.info(f"PYRAMID CAPITAL | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT}")
+        logger.info(f"PYRAMID RISK | step={PYRAMID_STEP_PCT} target_leverage={PYRAMID_LEVERAGE}x effective_leverage_cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD}")
         logger.info(f"NEWS 3-STAR={NEWS_FILTER_ENABLED} | janela=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | fail_closed={NEWS_FAIL_CLOSED}")
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
-        logger.info(f"V15 HARDENING | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
+        logger.info(f"HARDENING | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
         logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD}")
-        logger.info(f"PYRAMID V28 | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT} leverage={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} | BTC_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} | 2 bots/symbol LONG+SHORT")
+        logger.info(f"PYRAMID | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT} leverage={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} native_risk_stop={PYRAMID_NATIVE_RISK_STOP} liq_buffer={LIQUIDATION_BUFFER_PCT} | BTC_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} | 2 bots/symbol LONG+SHORT")
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
@@ -3395,42 +3964,20 @@ class Bot:
         else:
             logger.warning("MODO SIMULACAO: nenhuma ordem real sera enviada")
 
-        # V27: RANGE is permanently retired from this Directional robot.
-        # On startup, close ONLY any legacy RANGE lots, preserving PYRAMID lots even when
-        # Aster aggregates them on the same symbol/positionSide. Then clear RANGE anchors/state.
+        # RANGE is permanently retired from this Directional robot. Retirement uses
+        # durable ledger ownership, never state.json alone, and is skipped in simulation.
         self.range_engines = []
-        if RETIRE_LEGACY_RANGE_ON_STARTUP:
-            for s in SYMBOLS:
-                legacy = self.store.state.get("range", {}).get(s, {})
-                eng = RangeEngine(s, self.client, self.md, self.news, self.account, self.exe, self.store,
-                                  allow_new_entries=False)
-                if LIVE_TRADING and legacy.get("basket"):
-                    ref_price = self.client.price(s)
-                    eng.retire_legacy_range(ref_price)
-                else:
-                    # No open RANGE basket: remove stale anchor/protect state without sending an order.
-                    legacy["basket"] = None
-                    legacy["status"] = "RETIRED"
-                    legacy["anchor"] = None
-                    legacy["protect_anchor"] = None
-                    legacy["failures"] = 0
-                    legacy["recovery_deficit"] = "0"
-                    legacy["last_result"] = "RETIRED_V28"
-                    legacy["last_update"] = now_iso()
-                    self.store.save()
-                    release_owner(self.store, s, eng.id)
-                    logger.warning(f"RANGE RETIRED V28 | {s} | sem basket aberto; anchor legado removido")
-            if LIVE_TRADING:
-                self.account.sync(force=True)
-                self.reconciler.reconcile()
-        else:
-            logger.warning("RANGE RETIRE V28 DESATIVADO POR ENV | RETIRE_LEGACY_RANGE_ON_STARTUP=0")
+        self.retire_legacy_range_positions()
+        if LIVE_TRADING:
+            self.account.sync(force=True)
+            self.reconciler.reconcile()
+
         if PYRAMID_ENGINE_ENABLED:
             self.pyramid_engines = []
             if not LIVE_TRADING:
                 self._migrate_single_g0_to_legacy()
 
-            # V28: uma única escada ativa por símbolo/lado: PYRAMID original.
+            # Uma única escada ativa por símbolo/lado: PYRAMID original.
             for s in SYMBOLS:
                 for side in ("LONG", "SHORT"):
                     legacy_key = f"{s}:{side}"
@@ -3442,7 +3989,7 @@ class Bot:
                         )
                     )
 
-                    # Compatibilidade: se V27 deixou G0 com legs simultâneas ao LEGACY,
+                    # Compatibilidade: se um estado antigo deixou G0 com legs simultâneas ao LEGACY,
                     # G0 é gerenciado sem receber novas adições.
                     gkey = f"{s}:{side}:G0"
                     g0 = self.store.state.get("pyramid_grids", {}).get(gkey, {})
@@ -3597,21 +4144,21 @@ class Bot:
                 d = e.diagnostic(mark)
                 if d.get("status") == "WAITING_TRIGGER":
                     logger.info(
-                        f"PYRAMID WAIT V28 | {e.id} | status={d['status']} reason={d['reason']} "
+                        f"PYRAMID WAIT | {e.id} | status={d['status']} reason={d['reason']} "
                         f"mark={d['mark']} anchor={d['anchor']} next_level={d['level']} "
                         f"trigger={d['trigger']} faltam_pct={d['remaining_pct']:.6f}% "
                         f"next_notional_usd={d['desired_notional']} legs={d['legs']} eq={d['equity']} net={d['net']}"
                     )
                 elif d.get("status") == "TRIGGER_REACHED":
                     logger.warning(
-                        f"PYRAMID TRIGGER V28 | {e.id} | status={d['status']} reason={d['reason']} "
+                        f"PYRAMID TRIGGER | {e.id} | status={d['status']} reason={d['reason']} "
                         f"mark={d['mark']} trigger={d['trigger']} next_level={d['level']} "
                         f"next_notional_usd={d['desired_notional']} legs={d['legs']}"
                     )
                 else:
-                    logger.info(f"PYRAMID STATUS V28 | {e.id} | {d}")
+                    logger.info(f"PYRAMID STATUS | {e.id} | {d}")
             except Exception as ex:
-                logger.warning(f"PYRAMID DIAGNOSTIC FAIL V28 | {e.id} | {ex}")
+                logger.warning(f"PYRAMID DIAGNOSTIC FAIL | {e.id} | {ex}")
         with self.news._lock:
             news_events = len(self.news.events)
             news_source = self.news.last_source
@@ -3626,7 +4173,7 @@ class Bot:
             f"mode=HEDGE margin=ISOLATED multi_strategy_same_symbol={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} native_protection={NATIVE_PROTECTIVE_ORDERS} | "
             f"news={news_health} source={news_source} events={news_events} age_s={news_age} fail_closed={NEWS_FAIL_CLOSED} window=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | "
             f"range=False legacy_range_engines={len(self.range_engines)} | "
-            f"pyramid={PYRAMID_ENGINE_ENABLED} architecture=SINGLE bankroll_logico={PYRAMID_BANKROLL_USD} initial={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT} btc_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} lev={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD}"
+            f"pyramid={PYRAMID_ENGINE_ENABLED} architecture=SINGLE bankroll_logico={PYRAMID_BANKROLL_USD} initial={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT} btc_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} lev={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} native_risk_stop={PYRAMID_NATIVE_RISK_STOP}"
         )
         if LIVE_TRADING:
             try:
@@ -3836,7 +4383,7 @@ class Bot:
                     try:
                         self.reconciler.reconcile()
                     except Exception as _re:
-                        logger.warning(f"PERIODIC RECONCILE FAIL V18 | {_re}")
+                        logger.warning(f"PERIODIC RECONCILE FAIL | {_re}")
 
                 for e in self.range_engines:
                     p = prices.get(e.symbol)
