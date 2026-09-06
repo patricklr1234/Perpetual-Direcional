@@ -97,7 +97,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.19.0-v51-verified-hard-kill-guard"
+VERSION = "8.22.0-v54-log-regression-hardened"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -226,6 +226,7 @@ CANCEL_CONFIRM_ATTEMPTS = int(os.getenv("CANCEL_CONFIRM_ATTEMPTS", "8"))
 CANCEL_CONFIRM_DELAY_SECONDS = float(os.getenv("CANCEL_CONFIRM_DELAY_SECONDS", "0.25"))
 LEDGER_RECONCILE_ON_STARTUP = os.getenv("LEDGER_RECONCILE_ON_STARTUP", "1") == "1"
 SELF_TEST_ON_STARTUP = os.getenv("SELF_TEST_ON_STARTUP", "1") == "1"
+AUTO_REPAIR_ZERO_PHYSICAL_LEDGER = os.getenv("AUTO_REPAIR_ZERO_PHYSICAL_LEDGER", "1") == "1"
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -1410,8 +1411,13 @@ class StateStore:
             return self.state.get("kill_switch", {}).get("mode", "OFF")
 
     def set_trade_gate(self, allowed: bool, reason: Optional[str] = None) -> None:
+        allowed = bool(allowed)
+        normalized_reason = str(reason) if reason is not None else None
         with self.lock:
-            self.state["trade_gate"] = {"open_allowed": bool(allowed), "reason": reason, "at": now_iso()}
+            current = self.state.get("trade_gate", {}) or {}
+            if bool(current.get("open_allowed", True)) == allowed and current.get("reason") == normalized_reason:
+                return
+            self.state["trade_gate"] = {"open_allowed": allowed, "reason": normalized_reason, "at": now_iso()}
             self.save()
 
     def entry_allowed(self) -> Tuple[bool, Optional[str]]:
@@ -1428,24 +1434,44 @@ class StateStore:
             return bool(g.get("open_allowed", True)), g.get("reason")
 
     def set_operational_block(self, block_id: str, reason: Optional[str]) -> None:
+        key = str(block_id)
+        normalized = str(reason) if reason else None
+        changed = False
         with self.lock:
             blocks = self.state.setdefault("operational_blocks", {})
-            if reason:
-                blocks[str(block_id)] = str(reason)
-            else:
-                blocks.pop(str(block_id), None)
-            self.save()
-        logger.warning("OPERATIONAL BLOCK | id=%s | active=%s | reason=%s", block_id, bool(reason), reason)
+            previous = blocks.get(key)
+            if normalized:
+                if previous != normalized:
+                    blocks[key] = normalized
+                    changed = True
+            elif key in blocks:
+                blocks.pop(key, None)
+                changed = True
+            if changed:
+                self.save()
+        if changed:
+            log = logger.warning if normalized else logger.info
+            log("OPERATIONAL BLOCK | id=%s | active=%s | reason=%s", block_id, bool(normalized), normalized)
 
     def set_protection_block(self, strategy_id: str, reason: Optional[str]) -> None:
+        key = str(strategy_id)
+        normalized = str(reason) if reason else None
+        changed = False
         with self.lock:
             blocks = self.state.setdefault("protection_blocks", {})
-            if reason:
-                blocks[strategy_id] = str(reason)
-            else:
-                blocks.pop(strategy_id, None)
-            self.save()
-        logger.warning("PROTECTION BLOCK | strategy=%s | active=%s | reason=%s", strategy_id, bool(reason), reason)
+            previous = blocks.get(key)
+            if normalized:
+                if previous != normalized:
+                    blocks[key] = normalized
+                    changed = True
+            elif key in blocks:
+                blocks.pop(key, None)
+                changed = True
+            if changed:
+                self.save()
+        if changed:
+            log = logger.warning if normalized else logger.info
+            log("PROTECTION BLOCK | strategy=%s | active=%s | reason=%s", strategy_id, bool(normalized), normalized)
 
     def clear_soft_position_mismatch(self) -> bool:
         with self.lock:
@@ -1583,6 +1609,35 @@ class FillLedger:
             k = (str(sym).upper(), str(side).upper())
             out[k] = out.get(k, D(0)) + dec(q)
         return out
+
+    def zero_open_lots_for_symbol_side(self, symbol: str, side: str, reason: str = "EXCHANGE_ZERO_SIDE_RECONCILE") -> int:
+        """Mark open ledger lots closed only for one Hedge-Mode symbol/side.
+
+        This is called only after Reconciler proves that the exchange reports this exact
+        positionSide flat and that no open order for that side remains unaccounted for.
+        Lots are preserved as history; only open_qty/closed_ms are updated.
+        """
+        symbol = str(symbol).upper(); side = str(side).upper()
+        if side not in ("LONG", "SHORT"):
+            raise ValueError(f"position_side invalido para ledger repair: {side!r}")
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT leg_id FROM lots WHERE symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0",
+                (symbol, side),
+            ).fetchall()
+            if not rows:
+                return 0
+            t = now_ms()
+            self.db.execute(
+                "UPDATE lots SET open_qty='0', closed_ms=? WHERE symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0",
+                (t, symbol, side),
+            )
+            self.db.commit()
+        logger.warning(
+            "LEDGER SIDE AUTO-REPAIR | symbol=%s side=%s | ghost_lots_closed=%s | reason=%s",
+            symbol, side, len(rows), reason,
+        )
+        return len(rows)
 
     def open_strategy_qty(self, strategy_id: str, symbol: str, side: str) -> Decimal:
         with self.lock:
@@ -4028,6 +4083,102 @@ class Reconciler:
 
         return out
 
+    def _confirm_side_orders_gone(self, symbol: str, side: str) -> None:
+        """Cancel/verify only this Hedge-Mode side; opposite-side protection is untouched."""
+        symbol = str(symbol).upper(); side = str(side).upper()
+        attempts = max(1, CANCEL_CONFIRM_ATTEMPTS)
+        for attempt in range(attempts):
+            orders = self.client.open_orders(symbol)
+            if not isinstance(orders, list):
+                raise RuntimeError(f"openOrders indeterminado para {symbol}: {orders!r}")
+            target: List[Dict[str, Any]] = []
+            for order in orders:
+                ps = str(order.get("positionSide") or "").upper()
+                if ps and ps != side:
+                    continue
+                if not ps:
+                    raise RuntimeError(f"ordem sem positionSide impede repair seguro: {order!r}")
+                target.append(order)
+            if not target:
+                return
+            for order in target:
+                cid = str(order.get("clientOrderId") or order.get("origClientOrderId") or "")
+                if not cid:
+                    raise RuntimeError(f"ordem {symbol} {side} sem clientOrderId: {order!r}")
+                owner = self.ledger.order_owner(cid)
+                if owner is None:
+                    raise RuntimeError(f"ordem {symbol} {side} sem ownership no ledger: cid={cid}")
+                try:
+                    self.client.cancel_order(symbol, cid)
+                except Exception as exc:
+                    logger.warning(
+                        "RECONCILE SIDE CANCEL UNKNOWN | %s %s | cid=%s owner=%s | %s",
+                        symbol, side, cid, owner, exc,
+                    )
+            if attempt + 1 < attempts:
+                time.sleep(max(0.05, CANCEL_CONFIRM_DELAY_SECONDS))
+        verify = self.client.open_orders(symbol)
+        if not isinstance(verify, list):
+            raise RuntimeError(f"openOrders verify indeterminado para {symbol}: {verify!r}")
+        remaining = [o for o in verify if str(o.get("positionSide") or "").upper() == side]
+        if remaining:
+            raise RuntimeError(
+                f"ordens ainda abertas apos cancelamento seletivo {symbol} {side}: "
+                f"{[(o.get('clientOrderId'), o.get('status')) for o in remaining]}"
+            )
+
+    def _confirm_physical_side_zero(self, symbol: str, side: str) -> None:
+        step = self.rules.rules[symbol].step_size if symbol in self.rules.rules else D("0.00000001")
+        for check_idx in range(2):
+            rows = self.client.positions(symbol)
+            if not isinstance(rows, list):
+                raise RuntimeError(f"positionRisk indeterminado para {symbol}: {rows!r}")
+            qty = D(0)
+            for p in rows:
+                if str(p.get("symbol") or "").upper() == symbol and str(p.get("positionSide") or "").upper() == side:
+                    qty = abs(dec(p.get("positionAmt")))
+                    break
+            if qty >= step:
+                raise RuntimeError(f"positionSide deixou de estar flat durante repair: {symbol} {side} qty={qty}")
+            if check_idx == 0:
+                time.sleep(0.10)
+
+    def _clear_pyramid_state_side_after_exchange_flat(self, symbol: str, side: str) -> int:
+        """Clear stale logical exposure without fabricating realized PnL.
+
+        Because the close happened outside this process observation, the ladder is left
+        stopped for review instead of silently resuming with invented accounting.
+        """
+        changed = 0
+        with self.store.lock:
+            for bucket in ("pyramid", "pyramid_grids"):
+                for st in self.store.state.get(bucket, {}).values():
+                    if not isinstance(st, dict):
+                        continue
+                    if str(st.get("symbol") or "").upper() != symbol or str(st.get("side") or "").upper() != side:
+                        continue
+                    if not (st.get("legs") or st.get("native_risk_stop")):
+                        continue
+                    st["legs"] = []
+                    st["native_risk_stop"] = None
+                    st["last_unrealized"] = "0"
+                    st["last_net_pnl"] = str(dec(st.get("realized_pnl")))
+                    st["anchor"] = None
+                    st["next_level"] = 1
+                    st["last_trigger_price"] = None
+                    st["stopped"] = True
+                    st["stop_reason"] = "EXCHANGE_FLAT_RECOVERY_UNACCOUNTED"
+                    st["last_update"] = now_iso()
+                    changed += 1
+            if changed:
+                maintenance = self.store.state.setdefault("maintenance", {})
+                rec = maintenance.setdefault("exchange_flat_recoveries", [])
+                rec.append({"at": now_iso(), "symbol": symbol, "side": side, "reason": "PHYSICAL_ZERO_LEDGER_STALE"})
+                if len(rec) > 100:
+                    del rec[:-100]
+                self.store.save()
+        return changed
+
     def state_ledger_mismatches(self, ledger_expected: Dict[Tuple[str, str], Decimal]
                                 ) -> List[Tuple[Tuple[str, str], Decimal, Decimal]]:
         state_expected = self.expected_from_state_by_symbol_side()
@@ -4050,6 +4201,44 @@ class Reconciler:
             step = self.rules.rules[k[0]].step_size if k[0] in self.rules.rules else D("0.00000001")
             if abs(e - a) >= step:
                 mismatches.append((k, e, a))
+        if mismatches and AUTO_REPAIR_ZERO_PHYSICAL_LEDGER:
+            repaired_flat_sides: List[Tuple[str, str, int]] = []
+            for (sym, side), exp_qty, act_qty in list(mismatches):
+                step = self.rules.rules[sym].step_size if sym in self.rules.rules else D("0.00000001")
+                if exp_qty < step or act_qty >= step:
+                    continue
+                try:
+                    self._confirm_side_orders_gone(sym, side)
+                    self._confirm_physical_side_zero(sym, side)
+                    cleared_state = self._clear_pyramid_state_side_after_exchange_flat(sym, side)
+                    n = self.ledger.zero_open_lots_for_symbol_side(
+                        sym, side,
+                        reason=f"exchange_flat_confirmed; pyramid_state_records_cleared={cleared_state}",
+                    )
+                    if n:
+                        repaired_flat_sides.append((sym, side, n))
+                        logger.warning(
+                            "RECONCILE | AUTO-REPAIRED FLAT PYRAMID SIDE | %s %s | ghost_lots=%s state_records=%s | ladder=STOPPED_UNACCOUNTED | opposite_side_untouched",
+                            sym, side, n, cleared_state,
+                        )
+                except Exception as exc:
+                    reason = f"FLAT_SIDE_REPAIR_UNCONFIRMED:{sym}:{side}:{exc}"
+                    self.store.set_trade_gate(False, reason)
+                    logger.error("RECONCILE | FLAT SIDE AUTO-REPAIR ABORTADO | %s", reason)
+            if repaired_flat_sides:
+                expected = self.expected_by_symbol_side()
+                snap = self.snapshot(); actual = snap.positions
+                mismatches = []
+                for k in set(expected) | set(actual):
+                    e = expected.get(k, D(0)); a = actual.get(k, D(0))
+                    step = self.rules.rules[k[0]].step_size if k[0] in self.rules.rules else D("0.00000001")
+                    if abs(e - a) >= step:
+                        mismatches.append((k, e, a))
+                logger.warning(
+                    "RECONCILE | FLAT SIDE AUTO-REPAIR RESULT | repaired=%s remaining=%s",
+                    repaired_flat_sides, mismatches,
+                )
+
         if mismatches:
             # AUTO-REPAIR conservador: corrige somente RANGE ghost lots quando a quantidade
             # física é explicada EXATAMENTE pelas demais estratégias (ex.: PYRAMID).
@@ -4634,9 +4823,8 @@ class Bot:
             logger.warning(f"HEARTBEAT account sync | {e}")
         parts = []
         with self.store.lock:
-            for s in SYMBOLS:
-                r = self.store.state["range"][s]
-                parts.append(f"R:{s}:eq={r['equity']},RD={r['recovery_deficit']},status={r['status']},fail={r['failures']}")
+            # RANGE is retired in this robot and retirement may intentionally clear state["range"].
+            # Heartbeat therefore reports only active/drain-only PYRAMID engines.
             for e in self.pyramid_engines:
                 p = e.st()
                 parts.append(f"P:{p['symbol']}:{p['side']}:{p.get('grid_id','LEGACY')}:eq={p['equity']},lvl={p['next_level']},legs={len(p.get('legs',[]) or [])},net={p.get('last_net_pnl','0')},stop={int(bool(p.get('stopped')))},phase={p.get('grid_phase','0')}")
@@ -4942,8 +5130,10 @@ class Bot:
     def shutdown(self) -> None:
         logger.info("SHUTDOWN | salvando estado")
         self.store.save()
-        try: self.ledger.close()
-        except Exception: pass
+        try:
+            self.ledger.close()
+        except Exception as exc:
+            logger.warning("SHUTDOWN | falha ao fechar ledger SQLite | %s", exc)
         self.md.stop.set(); self.news.stop.set(); self.stop.set()
 
 
