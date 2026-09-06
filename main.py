@@ -97,7 +97,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.22.0-v54-log-regression-hardened"
+VERSION = "8.23.0-v55-leverage-normalization-guard"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -184,6 +184,7 @@ PYRAMID_NATIVE_STOP_REFRESH_SECONDS = float(os.getenv("PYRAMID_NATIVE_STOP_REFRE
 PYRAMID_MAX_LEVELS_PER_TICK = int(os.getenv("PYRAMID_MAX_LEVELS_PER_TICK", "20"))
 PYRAMID_APPLY_NEWS_FILTER = os.getenv("PYRAMID_APPLY_NEWS_FILTER", "1") == "1"
 PYRAMID_STOP_AFTER_MAX_LOSS = os.getenv("PYRAMID_STOP_AFTER_MAX_LOSS", "1") == "1"
+NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP = os.getenv("NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP", "1") == "1"
 
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "5000"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
@@ -4434,6 +4435,201 @@ class Bot:
         self.pyramid_engines: List[PyramidEngine] = []
         self.last_hb = 0.0
 
+    def _apply_leverage_retire_close_to_state(self, symbol: str, side: str, leg_id: str, pnl_delta: Decimal) -> None:
+        """Reflect one confirmed leverage-normalization close into persistent strategy state."""
+        symbol = str(symbol).upper(); side = str(side).upper(); leg_id = str(leg_id)
+        with self.store.lock:
+            matched = False
+            for bucket in ("pyramid", "pyramid_grids"):
+                for st in self.store.state.get(bucket, {}).values():
+                    if not isinstance(st, dict):
+                        continue
+                    if str(st.get("symbol") or "").upper() != symbol or str(st.get("side") or "").upper() != side:
+                        continue
+                    legs = list(st.get("legs", []) or [])
+                    keep = [leg for leg in legs if str(leg.get("id")) != leg_id]
+                    if len(keep) == len(legs):
+                        continue
+                    st["legs"] = keep
+                    st["realized_pnl"] = str(dec(st.get("realized_pnl")) + dec(pnl_delta))
+                    st["equity"] = str(dec(st.get("bankroll", PYRAMID_BANKROLL_USD)) + dec(st.get("realized_pnl")))
+                    st["last_unrealized"] = "0"
+                    st["last_net_pnl"] = str(dec(pnl_delta))
+                    st["native_risk_stop"] = None
+                    st["last_update"] = now_iso()
+                    matched = True
+            if not matched:
+                raise RuntimeError(f"LEVERAGE NORMALIZE STATE LEG NAO ENCONTRADA | {symbol} {side} leg={leg_id}")
+            self.store.save()
+
+    def _reset_pyramid_symbol_after_leverage_normalize(self, symbol: str) -> None:
+        """Reset anchors/levels after inherited exposure is flattened and leverage is really 10x."""
+        symbol = str(symbol).upper()
+        with self.store.lock:
+            for bucket in ("pyramid", "pyramid_grids"):
+                for st in self.store.state.get(bucket, {}).values():
+                    if not isinstance(st, dict) or str(st.get("symbol") or "").upper() != symbol:
+                        continue
+                    if st.get("legs"):
+                        raise RuntimeError(f"LEVERAGE NORMALIZE RESET COM LEGS ABERTAS | {symbol} | {st.get('strategy')}")
+                    st["anchor"] = None
+                    st["next_level"] = 1
+                    st["levels_filled"] = 0
+                    st["last_trigger_price"] = None
+                    st["native_risk_stop"] = None
+                    st["last_unrealized"] = "0"
+                    st["last_net_pnl"] = str(dec(st.get("realized_pnl")))
+                    st["stopped"] = False
+                    st["stop_reason"] = None
+                    st["last_update"] = now_iso()
+            maintenance = self.store.state.setdefault("maintenance", {})
+            rec = maintenance.setdefault("leverage_normalizations", [])
+            rec.append({"at": now_iso(), "symbol": symbol, "target_leverage": PYRAMID_MAX_EFFECTIVE_LEVERAGE})
+            if len(rec) > 100:
+                del rec[:-100]
+            self.store.save()
+
+    def normalize_inherited_overleverage(self) -> None:
+        """Retire bot-owned inherited exposure above the Pyramid leverage ceiling.
+
+        Aster rejects leverage reduction in ISOLATED mode while a symbol has an open
+        position (-4161). Therefore a real normalization must: prove ownership, cancel
+        only bot-owned orders, flatten the symbol, confirm physical zero, set leverage,
+        verify the exchange value, and only then re-arm the Pyramid state.
+        """
+        if not LIVE_TRADING or not NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP:
+            return
+        target = max(MIN_LEVERAGE, min(PYRAMID_MAX_EFFECTIVE_LEVERAGE, PYRAMID_LEVERAGE,
+                                      MAX_REQUESTED_LEVERAGE, BOT_HARD_MAX_LEVERAGE,
+                                      API_HARD_MAX_LEVERAGE))
+        ledger_expected = self.ledger.open_by_symbol_side()
+        state_expected = self.reconciler.expected_from_state_by_symbol_side()
+
+        for symbol in SYMBOLS:
+            current, open_count = self.account.active_symbol_leverage(symbol)
+            if not open_count or current is None or current <= target:
+                continue
+            block_id = f"LEVERAGE_NORMALIZE:{symbol}"
+            self.store.set_operational_block(block_id, f"INHERITED_LEVERAGE_{current}X_GT_{target}X")
+            logger.critical(
+                "LEVERAGE NORMALIZE | START | %s | inherited=%sx target=%sx positions=%s",
+                symbol, current, target, open_count,
+            )
+            try:
+                rows = self.client.positions(symbol)
+                if not isinstance(rows, list):
+                    raise RuntimeError(f"positionRisk indeterminado para {symbol}: {rows!r}")
+                physical = {"LONG": D(0), "SHORT": D(0)}
+                refs = {"LONG": D(0), "SHORT": D(0)}
+                step = self.rules.rules[symbol].step_size
+                for p in rows:
+                    if str(p.get("symbol") or "").upper() != symbol:
+                        continue
+                    side = str(p.get("positionSide") or "").upper()
+                    if side not in physical:
+                        continue
+                    q = abs(dec(p.get("positionAmt")))
+                    physical[side] = q
+                    refs[side] = dec(p.get("markPrice")) or dec(p.get("entryPrice"))
+
+                for side in ("LONG", "SHORT"):
+                    pq = physical[side]
+                    lq = ledger_expected.get((symbol, side), D(0))
+                    sq = state_expected.get((symbol, side), D(0))
+                    if abs(pq - lq) >= step or abs(lq - sq) >= step:
+                        raise RuntimeError(
+                            f"ownership nao provado {symbol} {side}: physical={pq} ledger={lq} state={sq} step={step}"
+                        )
+
+                lots = [x for x in self.ledger.open_lots_by_strategy_prefix("PYRAMID:") if x["symbol"] == symbol]
+                for lot in lots:
+                    if str(lot.get("source") or "").upper() not in ("BOT", "STATE_BOOTSTRAP"):
+                        raise RuntimeError(f"lot sem ownership confiavel impede normalizacao segura: {lot!r}")
+
+                orders = self.client.open_orders(symbol)
+                if not isinstance(orders, list):
+                    raise RuntimeError(f"openOrders indeterminado para {symbol}: {orders!r}")
+                for order in orders:
+                    cid = str(order.get("clientOrderId") or order.get("origClientOrderId") or "")
+                    if not cid:
+                        raise RuntimeError(f"ordem sem clientOrderId impede normalizacao segura: {order!r}")
+                    owner = self.ledger.order_owner(cid)
+                    if not owner or not str(owner).startswith("PYRAMID:"):
+                        raise RuntimeError(f"ordem sem ownership PYRAMID impede normalizacao: cid={cid} owner={owner}")
+
+                self.client.cancel_all_confirmed(symbol)
+
+                # Close durable lots in ledger order. close_leg re-checks physical qty and
+                # records the actual exchange fill/cost before we mutate strategy state.
+                for lot in lots:
+                    side = str(lot["side"]).upper()
+                    ref = refs.get(side) or D(0)
+                    if ref <= 0:
+                        raise RuntimeError(f"preco de referencia ausente para {symbol} {side}")
+                    rec = self.exe.close_leg(
+                        str(lot["strategy_id"]), symbol,
+                        {"id": lot["id"], "side": side, "qty": lot["qty"], "entry_price": lot["entry_price"]},
+                        ref, "INHERITED_OVERLEVERAGE_NORMALIZATION",
+                    )
+                    if rec is None:
+                        raise RuntimeError(f"close_leg nao confirmou fechamento: {lot!r}")
+                    self._apply_leverage_retire_close_to_state(
+                        symbol, side, str(rec["leg_id"]), dec(rec.get("pnl_est"))
+                    )
+
+                # Prove the symbol is physically flat twice before changing leverage.
+                for check_idx in range(2):
+                    verify_rows = self.client.positions(symbol)
+                    if not isinstance(verify_rows, list):
+                        raise RuntimeError(f"positionRisk verify indeterminado para {symbol}: {verify_rows!r}")
+                    remain = []
+                    for p in verify_rows:
+                        if str(p.get("symbol") or "").upper() != symbol:
+                            continue
+                        side = str(p.get("positionSide") or "").upper()
+                        q = abs(dec(p.get("positionAmt")))
+                        if side in ("LONG", "SHORT") and q >= step:
+                            remain.append((side, q))
+                    if remain:
+                        raise RuntimeError(f"simbolo nao ficou flat apos normalizacao: {symbol} {remain}")
+                    if check_idx == 0:
+                        time.sleep(0.15)
+
+                resp = self.client.set_leverage(symbol, target)
+                response_lev = int(dec((resp or {}).get("leverage"))) if isinstance(resp, dict) else 0
+                if response_lev != target:
+                    raise RuntimeError(f"set_leverage sem confirmacao alvo: {symbol} response={resp!r} target={target}")
+
+                # Flat position rows should now expose the new symbol leverage. Verify when present.
+                verify_rows = self.client.positions(symbol)
+                reported = []
+                if isinstance(verify_rows, list):
+                    for p in verify_rows:
+                        if str(p.get("symbol") or "").upper() == symbol:
+                            try:
+                                lv = int(dec(p.get("leverage")))
+                                if lv > 0:
+                                    reported.append(lv)
+                            except Exception:
+                                pass
+                if reported and any(lv != target for lv in reported):
+                    raise RuntimeError(f"leverage verify divergente: {symbol} reported={reported} target={target}")
+
+                self._reset_pyramid_symbol_after_leverage_normalize(symbol)
+                self.store.set_operational_block(block_id, None)
+                logger.warning(
+                    "LEVERAGE NORMALIZE | COMPLETE | %s | inherited=%sx -> %sx | symbol_flat_confirmed=True | pyramid_rearmed=True",
+                    symbol, current, target,
+                )
+                # Keep comparisons fresh before processing the next symbol.
+                ledger_expected = self.ledger.open_by_symbol_side()
+                state_expected = self.reconciler.expected_from_state_by_symbol_side()
+            except Exception as exc:
+                reason = f"LEVERAGE_NORMALIZE_FAILED:{symbol}:{exc}"
+                self.store.set_operational_block(block_id, reason)
+                logger.exception("LEVERAGE NORMALIZE | FAIL CLOSED | %s", reason)
+                raise RuntimeError(reason) from exc
+
     def _retire_empty_pyramid_grid(self, st: Dict[str, Any], reason: str) -> None:
         st["anchor"] = None
         st["next_level"] = max(1, int(st.get("next_level", 1)))
@@ -4587,7 +4783,7 @@ class Bot:
         logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False (legacy positions auto-close on startup) | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} architecture=SINGLE_LONG_SHORT_PER_SYMBOL | INDICADORES=NONE")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
         logger.info(f"PYRAMID CAPITAL | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT}")
-        logger.info(f"PYRAMID RISK | step={PYRAMID_STEP_PCT} target_leverage={PYRAMID_LEVERAGE}x effective_leverage_cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD}")
+        logger.info(f"PYRAMID RISK | step={PYRAMID_STEP_PCT} target_leverage={PYRAMID_LEVERAGE}x effective_leverage_cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} | normalize_inherited_overleverage={NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP}")
         logger.info(f"NEWS 3-STAR={NEWS_FILTER_ENABLED} | janela=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | fail_closed={NEWS_FAIL_CLOSED}")
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
         logger.info(f"HARDENING | state_backup={STATE_BACKUP_FILE} | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
@@ -4614,6 +4810,7 @@ class Bot:
             self._migrate_single_g0_to_legacy()
             if LEDGER_RECONCILE_ON_STARTUP:
                 self.ledger.bootstrap_from_state(self.store)
+            self.normalize_inherited_overleverage()
             if EMERGENCY_CLOSE_ALL_AND_RESET:
                 self.emergency_close_all_and_reset()
             self.reconciler.reconcile()
