@@ -97,7 +97,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.18.0-v50-confirmed-cancel-guard"
+VERSION = "8.19.0-v51-verified-hard-kill-guard"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -4544,9 +4544,10 @@ class Bot:
             f"EMERGENCY RESET CONCLUIDO | id={EMERGENCY_RESET_ID} | posicoes=0 | ordens=0 | estado zerado | novas entradas usam notional base configurado"
         )
 
-    def hard_kill(self) -> None:
+    def hard_kill(self) -> bool:
+        """Fail-closed HARD kill. Returns True only after exchange proves zero exposure."""
         if not LIVE_TRADING:
-            return
+            return True
         logger.error("HARD KILL EXECUTION | cancelando ordens e fechando posicoes conhecidas")
         cancel_guard_ok = True
         for s in SYMBOLS:
@@ -4557,18 +4558,69 @@ class Bot:
                 logger.critical(f"HARD KILL cancel NAO CONFIRMADO {s} | {e}")
         if not cancel_guard_ok:
             logger.critical("HARD KILL | fechamento a mercado adiado: cancelamento de ordens nao foi confirmado em todos os simbolos")
-            return
+            return False
+
+        try:
+            rows = self.client.positions()
+            if not isinstance(rows, list):
+                rows = [rows] if rows else []
+        except Exception as e:
+            logger.critical(f"HARD KILL | positionRisk indisponivel antes do fechamento | {e}")
+            return False
+        fallback_price: Dict[str, Decimal] = {}
+        for row in rows:
+            sym = str(row.get("symbol") or "").upper()
+            px = dec(row.get("markPrice") or row.get("entryPrice") or 0)
+            if sym in SYMBOLS and px > 0:
+                fallback_price[sym] = px
+
+        close_errors = False
         for e in self.range_engines:
             try:
                 st = e.st(); b = st.get("basket")
-                p = self.md.get(e.symbol)
-                if b and p: e._close_basket(p, "HARD_KILL", protect_after=True)
-            except Exception as ex: logger.exception(f"HARD KILL range {e.symbol} | {ex}")
+                p = self.md.get(e.symbol) or fallback_price.get(e.symbol)
+                if b:
+                    if not p or p <= 0:
+                        raise RuntimeError("preco de referencia indisponivel para fechar RANGE legado em HARD_KILL")
+                    e._close_basket(p, "HARD_KILL", protect_after=False)
+            except Exception as ex:
+                close_errors = True
+                logger.exception(f"HARD KILL range {e.symbol} | {ex}")
         for e in self.pyramid_engines:
             try:
-                st = e.st(); p = self.md.get(e.symbol)
-                if st.get("legs") and p: e._stop_and_close(p, e._net_unrealized(p))
-            except Exception as ex: logger.exception(f"HARD KILL pyramid {e.id} | {ex}")
+                st = e.st(); p = self.md.get(e.symbol) or fallback_price.get(e.symbol)
+                if st.get("legs"):
+                    if not p or p <= 0:
+                        raise RuntimeError("preco de referencia indisponivel para fechar PYRAMID em HARD_KILL")
+                    e._stop_and_close(p, e._net_unrealized(p), close_reason="HARD_KILL")
+            except Exception as ex:
+                close_errors = True
+                logger.exception(f"HARD KILL pyramid {e.id} | {ex}")
+
+        remaining: List[Dict[str, Any]] = []
+        for _ in range(5):
+            try:
+                snap = self.client.positions()
+                if not isinstance(snap, list):
+                    snap = [snap] if snap else []
+                remaining = [
+                    p for p in snap
+                    if str(p.get("symbol") or "").upper() in SYMBOLS and abs(dec(p.get("positionAmt"))) > 0
+                ]
+            except Exception as e:
+                logger.critical(f"HARD KILL | verificacao final positionRisk falhou | {e}")
+                return False
+            if not remaining:
+                if close_errors:
+                    logger.warning("HARD KILL | houve erro local de fechamento, mas exchange confirma exposicao zero")
+                logger.critical("HARD KILL CONFIRMADO | exchange confirma zero exposicao nos simbolos configurados")
+                return True
+            time.sleep(1)
+        logger.critical(
+            "HARD KILL NAO CONFIRMADO | posicoes restantes=%s",
+            [(p.get("symbol"), p.get("positionSide"), p.get("positionAmt")) for p in remaining],
+        )
+        return False
 
     def heartbeat(self) -> None:
         if time.time() - self.last_hb < HEARTBEAT_SECONDS:
@@ -4848,8 +4900,10 @@ class Bot:
                 if self.client.api_error_streak >= KILL_SWITCH_ON_API_ERRORS and self.store.killed() == "OFF":
                     self.store.kill("SOFT", f"API_ERROR_STREAK={self.client.api_error_streak}")
                 if self.store.killed() == "HARD":
-                    self.hard_kill()
-                    self.store.kill("SOFT", "HARD_KILL_EXECUTED; manual review required")
+                    if self.hard_kill():
+                        self.store.kill("SOFT", "HARD_KILL_CONFIRMED_ZERO_EXPOSURE; manual review required")
+                    else:
+                        logger.critical("HARD KILL permanece HARD | zero exposicao nao confirmado")
                 prices = {s: self.md.get(s) for s in SYMBOLS}
 
                 _now_reconcile = now_ms()
