@@ -79,8 +79,8 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "7.2.4-v23-shared-symbol-leverage-adopt"
-BOT_NAME = "ASTER_PERPETUAL_BOT_V21"
+VERSION = "7.5.0-v27-retire-legacy-range"
+BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL_V27"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
@@ -129,15 +129,23 @@ RANGE_TRIGGER_PCT = D(os.getenv("RANGE_TRIGGER_PCT", "0.01"))
 RANGE_TAKE_PROFIT_PCT = D(os.getenv("RANGE_TAKE_PROFIT_PCT", "0.01"))
 RANGE_HARD_STOP_PCT = D(os.getenv("RANGE_HARD_STOP_PCT", "0.02"))
 RANGE_REARM_PCT = D(os.getenv("RANGE_REARM_PCT", "0.03"))
-RANGE_ENGINE_ENABLED = os.getenv("RANGE_ENGINE_ENABLED", "1") == "1"
+RANGE_ENGINE_ENABLED = False  # V27: RANGE definitivamente aposentado neste robo
 
 PROTECTIVE_WATCHDOG_SECONDS = float(os.getenv("PROTECTIVE_WATCHDOG_SECONDS", "5"))
 
 # PYRAMID 1% engine: 2 robos independentes por ativo (LONG e SHORT).
 PYRAMID_ENGINE_ENABLED = os.getenv("PYRAMID_ENGINE_ENABLED", "1") == "1"
+RETIRE_LEGACY_RANGE_ON_STARTUP = os.getenv("RETIRE_LEGACY_RANGE_ON_STARTUP", "1") == "1"
 PYRAMID_BANKROLL_USD = D(os.getenv("PYRAMID_BANKROLL_USD", "10"))
 PYRAMID_INITIAL_NOTIONAL_USD = D(os.getenv("PYRAMID_INITIAL_NOTIONAL_USD", "100"))
 PYRAMID_STEP_PCT = D(os.getenv("PYRAMID_STEP_PCT", "0.01"))
+# The Directional robot is independent. Pyramid keeps its own operational anchor;
+# it does not try to complete or coordinate the RANGE grid of another account.
+PYRAMID_GRID_PHASES = tuple(
+    D(x.strip()) for x in os.getenv("PYRAMID_GRID_PHASES", "0").split(",") if x.strip()
+)
+PYRAMID_GRID_COUNT = max(1, len(PYRAMID_GRID_PHASES))
+PYRAMID_GRID_CAPITAL_SHARE = D(1) / D(PYRAMID_GRID_COUNT)
 PYRAMID_ADD_BANKROLL_PCT = D(os.getenv("PYRAMID_ADD_BANKROLL_PCT", "0.05"))
 PYRAMID_BTC_MIN_ADD_NOTIONAL_USD = D(os.getenv("PYRAMID_BTC_MIN_ADD_NOTIONAL_USD", "100"))
 PYRAMID_LEVERAGE = int(os.getenv("PYRAMID_LEVERAGE", "10"))
@@ -958,6 +966,9 @@ def empty_pyramid_state(symbol: str, side: str) -> Dict[str, Any]:
         "strategy": f"PYRAMID:{symbol}:{side}",
         "symbol": symbol,
         "side": side,
+        "grid_id": "LEGACY",
+        "grid_phase": "0",
+        "capital_share": "1",
         "bankroll": str(PYRAMID_BANKROLL_USD),
         "equity": str(PYRAMID_BANKROLL_USD),
         "anchor": None,
@@ -973,6 +984,33 @@ def empty_pyramid_state(symbol: str, side: str) -> Dict[str, Any]:
         "last_update": now_iso(),
     }
 
+def empty_pyramid_grid_state(symbol: str, side: str, grid_id: str, phase: Decimal) -> Dict[str, Any]:
+    side = str(side).upper()
+    share = PYRAMID_GRID_CAPITAL_SHARE
+    bankroll = PYRAMID_BANKROLL_USD * share
+    return {
+        "strategy": f"PYRAMID:{symbol}:{side}:{grid_id}",
+        "symbol": symbol,
+        "side": side,
+        "grid_id": grid_id,
+        "grid_phase": str(phase),
+        "capital_share": str(share),
+        "bankroll": str(bankroll),
+        "equity": str(bankroll),
+        "anchor": None,
+        "next_level": 1,
+        "legs": [],
+        "stopped": False,
+        "stop_reason": None,
+        "realized_pnl": "0",
+        "last_unrealized": "0",
+        "last_net_pnl": "0",
+        "levels_filled": 0,
+        "last_trigger_price": None,
+        "last_update": now_iso(),
+    }
+
+
 def fresh_state() -> Dict[str, Any]:
     return {
         "version": VERSION,
@@ -983,6 +1021,7 @@ def fresh_state() -> Dict[str, Any]:
         "protection_blocks": {},
         "range": {s: empty_range_state(s) for s in SYMBOLS},
         "pyramid": {f"{s}:{side}": empty_pyramid_state(s, side) for s in SYMBOLS for side in ("LONG", "SHORT")},
+        "pyramid_grids": {f"{s}:{side}:G{i}": empty_pyramid_grid_state(s, side, f"G{i}", phase) for s in SYMBOLS for side in ("LONG", "SHORT") for i, phase in enumerate(PYRAMID_GRID_PHASES)},
         "symbol_owner": {s: None for s in SYMBOLS},
         "last_wallet": {},
         "maintenance": {"completed_emergency_actions": []},
@@ -1005,6 +1044,7 @@ class StateStore:
         st.setdefault("protection_blocks", {})
         st.setdefault("range", {})
         st.setdefault("pyramid", {})
+        st.setdefault("pyramid_grids", {})
         st.setdefault("symbol_owner", {})
         st.setdefault("last_wallet", {})
         st.setdefault("maintenance", {"completed_emergency_actions": []})
@@ -1014,6 +1054,11 @@ class StateStore:
             for side in ("LONG", "SHORT"):
                 pkey = f"{s}:{side}"
                 st["pyramid"].setdefault(pkey, empty_pyramid_state(s, side))
+                for i, phase in enumerate(PYRAMID_GRID_PHASES):
+                    gkey = f"{s}:{side}:G{i}"
+                    st["pyramid_grids"].setdefault(
+                        gkey, empty_pyramid_grid_state(s, side, f"G{i}", phase)
+                    )
         st["version"] = VERSION
         return st
 
@@ -1240,12 +1285,13 @@ class FillLedger:
                     q = dec(leg.get("qty")); ep = dec(leg.get("entry_price")); lid = str(leg.get("id") or uuid.uuid4().hex)
                     if q > 0 and ep > 0:
                         self.record_open_lot(lid, f"RANGE:{sym}", sym, str(leg.get("side")), q, ep, lid, "STATE_BOOTSTRAP"); seeded += 1
-            for st in store.state.get("pyramid", {}).values():
-                st = st or {}
-                for leg in st.get("legs", []) or []:
-                    q = dec(leg.get("qty")); ep = dec(leg.get("entry_price")); lid = str(leg.get("id") or uuid.uuid4().hex)
-                    if q > 0 and ep > 0:
-                        self.record_open_lot(lid, str(st.get("strategy")), str(st.get("symbol")), str(leg.get("side")), q, ep, lid, "STATE_BOOTSTRAP"); seeded += 1
+            for bucket in ("pyramid", "pyramid_grids"):
+                for st in store.state.get(bucket, {}).values():
+                    st = st or {}
+                    for leg in st.get("legs", []) or []:
+                        q = dec(leg.get("qty")); ep = dec(leg.get("entry_price")); lid = str(leg.get("id") or uuid.uuid4().hex)
+                        if q > 0 and ep > 0:
+                            self.record_open_lot(lid, str(st.get("strategy")), str(st.get("symbol")), str(leg.get("side")), q, ep, lid, "STATE_BOOTSTRAP"); seeded += 1
         if seeded:
             logger.warning(f"LEDGER BOOTSTRAP V18 | lots_seeded={seeded} from state.json")
         return seeded
@@ -2233,8 +2279,10 @@ def _apply_realized_pnl_to_state(st: Dict[str, Any], pnl: Decimal, exit_price: D
 
 class RangeEngine:
     def __init__(self, symbol: str, client: AsterClient, md: MarketData, news: NewsFilter,
-                 account: AccountManager, exe: ExecutionEngine, store: StateStore):
+                 account: AccountManager, exe: ExecutionEngine, store: StateStore,
+                 allow_new_entries: bool = True):
         self.symbol = symbol
+        self.allow_new_entries = allow_new_entries
         self.id = f"RANGE:{symbol}"
         self.client = client
         self.md = md
@@ -2250,14 +2298,15 @@ class RangeEngine:
         total = D(0)
         wanted = str(position_side).upper()
         with self.store.lock:
-            for pst in self.store.state.get("pyramid", {}).values():
-                pst = pst or {}
-                if str(pst.get("symbol", "")).upper() != self.symbol:
-                    continue
-                if str(pst.get("side", "")).upper() != wanted:
-                    continue
-                for leg in pst.get("legs", []) or []:
-                    total += dec(leg.get("qty"))
+            for bucket in ("pyramid", "pyramid_grids"):
+                for pst in self.store.state.get(bucket, {}).values():
+                    pst = pst or {}
+                    if str(pst.get("symbol", "")).upper() != self.symbol:
+                        continue
+                    if str(pst.get("side", "")).upper() != wanted:
+                        continue
+                    for leg in pst.get("legs", []) or []:
+                        total += dec(leg.get("qty"))
         return total
 
     def _range_physical_capacity(self, position_side: str) -> Decimal:
@@ -2470,6 +2519,10 @@ class RangeEngine:
         st = self.st(); b = st.get("basket")
         if not b:
             return
+        rd_before = dec(st.get("recovery_deficit"))
+        recovery_attempt = int(b.get("alternations", 0)) > 0 or rd_before > 0
+        recovery_tp_hit = reason == "RECOVERY_LEG_TP_1PCT_CLOSE_ALL"
+
         self.exe.cancel_bracket(self.symbol, b.get("native_bracket"))
         self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
         self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
@@ -2489,20 +2542,84 @@ class RangeEngine:
                 closes.append(_c)
                 pnl += dec(_c.get("pnl_est"))
                 reserved_used[_side] = reserved_used.get(_side, D(0)) + dec(_c.get("qty"))
+
         _apply_realized_pnl_to_state(st, pnl, price, reason)
-        st["basket"] = None
-        st["failures"] = 0
-        if protect_after:
-            st["status"] = "PROTECT"
-            st["protect_anchor"] = str(price)
-            st["anchor"] = str(price)
-        else:
+        rd_after = dec(st.get("recovery_deficit"))
+
+        # V24: um martingale RANGE só é considerado ACERTO quando o PnL REALIZADO
+        # cobriu integralmente o déficit anterior. Nesse caso o estado operacional
+        # é zerado explicitamente; não dependemos de estado legado/migração.
+        recovery_success = recovery_attempt and recovery_tp_hit and rd_before > 0 and pnl >= rd_before
+        if recovery_success:
+            st["recovery_deficit"] = "0"
+            rd_after = D(0)
+            st["failures"] = 0
             st["status"] = "IDLE"
             st["anchor"] = str(price)
             st["protect_anchor"] = None
+            st["last_result"] = "RECOVERY_WIN_RESET"
+            protect_after = False
+            logger.warning(
+                f"RANGE RECOVERY RESET V24 | {self.symbol} | pnl_realizado={pnl} "
+                f"rd_before={rd_before} -> RD=0 failures=0 status=IDLE anchor={price}"
+            )
+        else:
+            st["failures"] = 0
+            # Se o preço tocou o TP, mas taxas/slippage impediram recuperar todo RD,
+            # não marcamos falso acerto. Preserva-se o déficit e entra em proteção.
+            if recovery_attempt and recovery_tp_hit and rd_after > 0:
+                protect_after = True
+                st["last_result"] = "RECOVERY_PARTIAL"
+                logger.warning(
+                    f"RANGE RECOVERY PARTIAL V24 | {self.symbol} | pnl_realizado={pnl} "
+                    f"rd_before={rd_before} rd_restante={rd_after} | mantendo recovery"
+                )
+            if protect_after:
+                st["status"] = "PROTECT"
+                st["protect_anchor"] = str(price)
+                st["anchor"] = str(price)
+            else:
+                st["status"] = "IDLE"
+                st["anchor"] = str(price)
+                st["protect_anchor"] = None
+
+        st["basket"] = None
+        st["last_update"] = now_iso()
         self.store.save()
         release_owner(self.store, self.symbol, self.id)
-        logger.info(f"RANGE CLOSE | {self.symbol} | reason={reason} pnl={pnl} equity={st['equity']} RD={st['recovery_deficit']} protect={protect_after}")
+        logger.info(
+            f"RANGE CLOSE V24 | {self.symbol} | reason={reason} pnl={pnl} equity={st['equity']} "
+            f"RD={st['recovery_deficit']} recovery_success={recovery_success} protect={protect_after}"
+        )
+
+    def retire_legacy_range(self, price: Decimal) -> None:
+        """Close only legacy RANGE exposure and permanently retire its operational state.
+
+        PYRAMID quantities on the same symbol/side are reserved by _close_basket(), so an
+        aggregated Aster position is reduced only by the virtual RANGE quantity.
+        """
+        st = self.st()
+        b = st.get("basket")
+        if b:
+            logger.warning(
+                f"RANGE RETIRE V27 | {self.symbol} | fechando somente lotes RANGE legados; "
+                f"legs={len(b.get('legs', []) or [])}"
+            )
+            self._close_basket(price, "MIGRATION_RETIRE_RANGE_V27", protect_after=False)
+            st = self.st()
+        # Operational recovery is intentionally discarded because this strategy is retired.
+        # Historical PnL/equity remain recorded in the state/trade ledger.
+        st["basket"] = None
+        st["status"] = "RETIRED"
+        st["anchor"] = None
+        st["protect_anchor"] = None
+        st["failures"] = 0
+        st["recovery_deficit"] = "0"
+        st["last_result"] = "RETIRED_V27"
+        st["last_update"] = now_iso()
+        self.store.save()
+        release_owner(self.store, self.symbol, self.id)
+        logger.warning(f"RANGE RETIRED V27 | {self.symbol} | novas_entradas=DESABILITADAS_PERMANENTEMENTE")
 
     def _reverse(self, price: Decimal) -> None:
         st = self.st(); b = st.get("basket")
@@ -2577,6 +2694,8 @@ class RangeEngine:
         with self.store.lock:
             st = self.st()
             if st.get("anchor") is None:
+                if not self.allow_new_entries:
+                    return
                 self._new_anchor(price)
                 return
             status = st.get("status", "IDLE")
@@ -2593,6 +2712,8 @@ class RangeEngine:
                     logger.info(f"RANGE PROTECT LIBERADO | {self.symbol} | move={move} | new_anchor={price} | RD={st['recovery_deficit']}")
                 return
             if status == "IDLE":
+                if not self.allow_new_entries:
+                    return
                 up = anchor * (D(1) + RANGE_TRIGGER_PCT)
                 dn = anchor * (D(1) - RANGE_TRIGGER_PCT)
                 if price >= up:
@@ -2769,15 +2890,23 @@ class PyramidEngine:
     é o limite de perda da cesta (caixa virtual).
     """
     def __init__(self, symbol: str, side: str, client: AsterClient, md: MarketData,
-                 news: NewsFilter, account: AccountManager, exe: ExecutionEngine, store: StateStore):
+                 news: NewsFilter, account: AccountManager, exe: ExecutionEngine, store: StateStore,
+                 state_bucket: str = "pyramid", state_key: Optional[str] = None,
+                 grid_id: str = "LEGACY", grid_phase: Decimal = D(0),
+                 allow_new_entries: bool = True):
         self.symbol = symbol
         self.side = side.upper()
-        self.id = f"PYRAMID:{symbol}:{self.side}"
+        self.state_bucket = state_bucket
+        self.state_key = state_key or f"{symbol}:{self.side}"
+        self.grid_id = grid_id
+        self.grid_phase = grid_phase
+        self.allow_new_entries = allow_new_entries
+        self.id = f"PYRAMID:{symbol}:{self.side}" if grid_id == "LEGACY" else f"PYRAMID:{symbol}:{self.side}:{grid_id}"
         self.client = client; self.md = md; self.news = news
         self.account = account; self.exe = exe; self.store = store
 
     def st(self) -> Dict[str, Any]:
-        return self.store.state["pyramid"][f"{self.symbol}:{self.side}"]
+        return self.store.state[self.state_bucket][self.state_key]
 
     def _trigger_price(self, anchor: Decimal, level: int) -> Decimal:
         if self.side == "LONG":
@@ -2806,14 +2935,15 @@ class PyramidEngine:
         return total
 
     def _desired_notional(self, level: int) -> Decimal:
+        share = dec(self.st().get("capital_share", "1"))
         if level <= 1:
-            return PYRAMID_INITIAL_NOTIONAL_USD
+            return PYRAMID_INITIAL_NOTIONAL_USD * share
         if self.symbol == "BTCUSDT":
             st = self.st()
-            cash_total = max(PYRAMID_BANKROLL_USD, dec(st.get("equity")))
+            cash_total = max(PYRAMID_BANKROLL_USD * share, dec(st.get("equity")))
             five_pct_cash = cash_total * PYRAMID_ADD_BANKROLL_PCT
-            return max(PYRAMID_BTC_MIN_ADD_NOTIONAL_USD, five_pct_cash)
-        return PYRAMID_BANKROLL_USD * PYRAMID_ADD_BANKROLL_PCT * D(PYRAMID_LEVERAGE)
+            return max(PYRAMID_BTC_MIN_ADD_NOTIONAL_USD * share, five_pct_cash)
+        return PYRAMID_BANKROLL_USD * share * PYRAMID_ADD_BANKROLL_PCT * D(PYRAMID_LEVERAGE)
 
     def _sizing(self, price: Decimal, level: int) -> Optional[Dict[str, Any]]:
         self.account.sync()
@@ -2840,6 +2970,8 @@ class PyramidEngine:
                 "recovery_multiplier": "1", "meta": {"engine": "PYRAMID_1PCT", "level": level}}
 
     def _entry_allowed(self) -> bool:
+        if not self.allow_new_entries:
+            return False
         if self.store.killed() != "OFF":
             return False
         gate_ok, gate_reason = self.store.entry_allowed()
@@ -2937,11 +3069,14 @@ class PyramidEngine:
         if st.get("stopped"):
             return
         if dec(st.get("anchor")) <= 0:
-            st["anchor"] = str(price)
+            if not self.allow_new_entries:
+                return
+            phased_anchor = price * (D(1) + self.grid_phase)
+            st["anchor"] = str(phased_anchor)
             st["next_level"] = max(1, int(st.get("next_level", 1)))
             st["last_update"] = now_iso()
             self.store.save()
-            logger.warning(f"PYRAMID ANCHOR V21 | {self.id} | anchor={price} | first_trigger={self._trigger_price(price, 1)}")
+            logger.warning(f"PYRAMID ANCHOR V26 | {self.id} | phase={self.grid_phase} anchor={st['anchor']} | first_trigger={self._trigger_price(dec(st['anchor']), 1)}")
             return
 
         legs = st.get("legs", []) or []
@@ -2949,8 +3084,8 @@ class PyramidEngine:
             net = self._net_unrealized(price)
             st["last_unrealized"] = str(net)
             st["last_net_pnl"] = str(dec(st.get("realized_pnl")) + net)
-            st["equity"] = str(PYRAMID_BANKROLL_USD + dec(st["last_net_pnl"]))
-            if net <= -PYRAMID_MAX_LOSS_USD:
+            st["equity"] = str(PYRAMID_BANKROLL_USD * dec(st.get("capital_share", "1")) + dec(st["last_net_pnl"]))
+            if net <= -(PYRAMID_MAX_LOSS_USD * dec(st.get("capital_share", "1"))):
                 self._stop_and_close(price, net)
                 return
 
@@ -3054,6 +3189,11 @@ class Reconciler:
 
 def run_internal_regression_checks() -> None:
     assert RANGE_SIGNAL_MODE == "VOLATILITY_ONLY"
+    assert RANGE_ENGINE_ENABLED is False
+    assert PYRAMID_GRID_PHASES == (D("0"),)
+    assert sum((PYRAMID_GRID_CAPITAL_SHARE for _ in PYRAMID_GRID_PHASES), D(0)) == D(1)
+    assert len(set(PYRAMID_GRID_PHASES)) == len(PYRAMID_GRID_PHASES)
+    assert all(D(0) <= x < PYRAMID_STEP_PCT for x in PYRAMID_GRID_PHASES)
     assert RANGE_TRIGGER_PCT > 0 and RANGE_TAKE_PROFIT_PCT > 0 and RANGE_HARD_STOP_PCT > 0
     assert RECOVERY_MULTIPLIER >= D(1) and MAX_RECOVERY_FAILURES >= 0
     assert configured_max_recovery_notional("BTCUSDT") >= configured_initial_notional("BTCUSDT")
@@ -3067,7 +3207,15 @@ def run_internal_regression_checks() -> None:
     assert PYRAMID_BTC_MIN_ADD_NOTIONAL_USD > 0
     assert PYRAMID_STEP_PCT > 0 and D(0) < PYRAMID_ADD_BANKROLL_PCT <= D(1)
     assert PYRAMID_LEVERAGE >= 1 and PYRAMID_MAX_LOSS_USD > 0
-    logger.info("SELF TEST V21 | PASS | range/pyramid/recovery/risk/tick invariants")
+
+    # V24 regression: realized PnL must clear RD exactly when it covers prior loss.
+    _t = {"equity":"10", "realized_pnl":"0", "recovery_deficit":"1", "wins":0, "losses":0}
+    _apply_realized_pnl_to_state(_t, D("1.25"), D("100"), "TEST_RECOVERY_WIN")
+    assert dec(_t["recovery_deficit"]) == D(0)
+    _t2 = {"equity":"10", "realized_pnl":"0", "recovery_deficit":"1", "wins":0, "losses":0}
+    _apply_realized_pnl_to_state(_t2, D("0.75"), D("100"), "TEST_RECOVERY_PARTIAL")
+    assert dec(_t2["recovery_deficit"]) == D("0.25")
+    logger.info("SELF TEST V27 | PASS | independent-pyramid-anchor/range-retire-selective/recovery-reset/risk/tick invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -3093,7 +3241,11 @@ class Bot:
     def startup(self) -> None:
         logger.info("=" * 90)
         logger.info(f"{BOT_NAME} | version={VERSION} | LIVE_TRADING={LIVE_TRADING}")
-        logger.info(f"SYMBOLS={SYMBOLS} | RANGE={RANGE_ENGINE_ENABLED} mode={RANGE_SIGNAL_MODE} | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} | INDICADORES=NONE")
+        if PYRAMID_ENGINE_ENABLED and PYRAMID_GRID_COUNT > 1 and not ALLOW_MULTI_STRATEGY_SAME_SYMBOL:
+            raise RuntimeError("PYRAMID subgrids requerem ALLOW_MULTI_STRATEGY_SAME_SYMBOL=1 para coexistirem no mesmo ativo")
+        if len(set(PYRAMID_GRID_PHASES)) != len(PYRAMID_GRID_PHASES) or any(x < 0 or x >= PYRAMID_STEP_PCT for x in PYRAMID_GRID_PHASES):
+            raise RuntimeError(f"PYRAMID_GRID_PHASES invalidas: {PYRAMID_GRID_PHASES}; use fases unicas entre 0 e PYRAMID_STEP_PCT")
+        logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False (legacy positions auto-close on startup) | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} independent_anchor_phases={PYRAMID_GRID_PHASES} | INDICADORES=NONE")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
         logger.info(f"BASE ETH/HYPE: bankroll={INITIAL_BANKROLL_USD} notional={INITIAL_OPERATION_NOTIONAL_USD} | BASE BTC: bankroll={BTC_INITIAL_BANKROLL_USD} notional={BTC_INITIAL_OPERATION_NOTIONAL_USD} | RANGE_RECOVERY={RECOVERY_MULTIPLIER}x | MAX_FAIL={MAX_RECOVERY_FAILURES}")
         logger.info(f"EXITS | RANGE_TP={RANGE_TAKE_PROFIT_PCT} RANGE_STOP={RANGE_HARD_STOP_PCT} | PYRAMID_MAX_LOSS={PYRAMID_MAX_LOSS_USD}")
@@ -3101,7 +3253,7 @@ class Bot:
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
         logger.info(f"V15 HARDENING | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
         logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD}")
-        logger.info(f"PYRAMID V19 | bankroll={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_cash_pct={PYRAMID_ADD_BANKROLL_PCT} leverage={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} | BTC_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} then=5pct_equity | 2 bots/symbol LONG+SHORT")
+        logger.info(f"PYRAMID V26 INDEPENDENT | phases={PYRAMID_GRID_PHASES} share={PYRAMID_GRID_CAPITAL_SHARE} | bankroll={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_cash_pct={PYRAMID_ADD_BANKROLL_PCT} leverage={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} | BTC_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} then=5pct_equity | 2 bots/symbol LONG+SHORT")
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
@@ -3128,11 +3280,58 @@ class Bot:
         else:
             logger.warning("MODO SIMULACAO: nenhuma ordem real sera enviada")
 
-        if RANGE_ENGINE_ENABLED:
-            self.range_engines = [RangeEngine(s, self.client, self.md, self.news, self.account, self.exe, self.store) for s in SYMBOLS]
+        # V27: RANGE is permanently retired from this Directional robot.
+        # On startup, close ONLY any legacy RANGE lots, preserving PYRAMID lots even when
+        # Aster aggregates them on the same symbol/positionSide. Then clear RANGE anchors/state.
+        self.range_engines = []
+        if RETIRE_LEGACY_RANGE_ON_STARTUP:
+            for s in SYMBOLS:
+                legacy = self.store.state.get("range", {}).get(s, {})
+                eng = RangeEngine(s, self.client, self.md, self.news, self.account, self.exe, self.store,
+                                  allow_new_entries=False)
+                if LIVE_TRADING and legacy.get("basket"):
+                    ref_price = self.client.price(s)
+                    eng.retire_legacy_range(ref_price)
+                else:
+                    # No open RANGE basket: remove stale anchor/protect state without sending an order.
+                    legacy["basket"] = None
+                    legacy["status"] = "RETIRED"
+                    legacy["anchor"] = None
+                    legacy["protect_anchor"] = None
+                    legacy["failures"] = 0
+                    legacy["recovery_deficit"] = "0"
+                    legacy["last_result"] = "RETIRED_V27"
+                    legacy["last_update"] = now_iso()
+                    self.store.save()
+                    release_owner(self.store, s, eng.id)
+                    logger.warning(f"RANGE RETIRED V27 | {s} | sem basket aberto; anchor legado removido")
+            if LIVE_TRADING:
+                self.account.sync(force=True)
+                self.reconciler.reconcile()
+        else:
+            logger.warning("RANGE RETIRE V27 DESATIVADO POR ENV | RETIRE_LEGACY_RANGE_ON_STARTUP=0")
         if PYRAMID_ENGINE_ENABLED:
-            self.pyramid_engines = [PyramidEngine(s, side, self.client, self.md, self.news, self.account, self.exe, self.store)
-                                    for s in SYMBOLS for side in ("LONG", "SHORT")]
+            self.pyramid_engines = []
+            # Drain any legacy Pyramid state with live legs, but never add new legacy levels.
+            for s in SYMBOLS:
+                for side in ("LONG", "SHORT"):
+                    legacy_key = f"{s}:{side}"
+                    legacy = self.store.state.get("pyramid", {}).get(legacy_key, {})
+                    if legacy.get("legs"):
+                        self.pyramid_engines.append(
+                            PyramidEngine(s, side, self.client, self.md, self.news, self.account, self.exe, self.store,
+                                          state_bucket="pyramid", state_key=legacy_key,
+                                          grid_id="LEGACY", grid_phase=D(0), allow_new_entries=False)
+                        )
+            for s in SYMBOLS:
+                for side in ("LONG", "SHORT"):
+                    for i, phase in enumerate(PYRAMID_GRID_PHASES):
+                        gid = f"G{i}"
+                        self.pyramid_engines.append(
+                            PyramidEngine(s, side, self.client, self.md, self.news, self.account, self.exe, self.store,
+                                          state_bucket="pyramid_grids", state_key=f"{s}:{side}:{gid}",
+                                          grid_id=gid, grid_phase=phase, allow_new_entries=True)
+                        )
         self.md.start(); self.news.start()
 
     def emergency_close_all_and_reset(self) -> None:
@@ -3243,9 +3442,9 @@ class Bot:
             for s in SYMBOLS:
                 r = self.store.state["range"][s]
                 parts.append(f"R:{s}:eq={r['equity']},RD={r['recovery_deficit']},status={r['status']},fail={r['failures']}")
-            for key, p in self.store.state.get("pyramid", {}).items():
-                if p.get("symbol") in SYMBOLS:
-                    parts.append(f"P:{p['symbol']}:{p['side']}:eq={p['equity']},lvl={p['next_level']},legs={len(p.get('legs',[]) or [])},net={p.get('last_net_pnl','0')},stop={int(bool(p.get('stopped')))}")
+            for e in self.pyramid_engines:
+                p = e.st()
+                parts.append(f"P:{p['symbol']}:{p['side']}:{p.get('grid_id','LEGACY')}:eq={p['equity']},lvl={p['next_level']},legs={len(p.get('legs',[]) or [])},net={p.get('last_net_pnl','0')},stop={int(bool(p.get('stopped')))},phase={p.get('grid_phase','0')}")
             ks = self.store.state["kill_switch"]
             gate = self.store.state.get("trade_gate", {})
         logger.info(f"HEARTBEAT | wallet={self.account.wallet_balance} avail={self.account.available_balance} unreal={self.account.unrealized} | kill={ks.get('mode')}:{ks.get('reason')} | entry_gate={gate.get('open_allowed')}:{gate.get('reason')} | ledger={self.ledger.open_by_symbol_side()} | {' | '.join(parts)}")
@@ -3304,7 +3503,7 @@ class Bot:
             f"HEALTH SNAPSHOT | version={VERSION} live={LIVE_TRADING} api_v3={'OK' if api_ok else 'DEGRADED'} signer={SIGNER_ADDRESS} | "
             f"mode=HEDGE margin=ISOLATED multi_strategy_same_symbol={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} native_protection={NATIVE_PROTECTIVE_ORDERS} | "
             f"news={news_health} source={news_source} events={news_events} age_s={news_age} fail_closed={NEWS_FAIL_CLOSED} window=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | "
-            f"range=VOLATILITY_ONLY trigger={RANGE_TRIGGER_PCT} tp={RANGE_TAKE_PROFIT_PCT} stop={RANGE_HARD_STOP_PCT} | "
+            f"range=False legacy_range_engines={len(self.range_engines)} | "
             f"pyramid={PYRAMID_ENGINE_ENABLED} bankroll={PYRAMID_BANKROLL_USD} initial={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_cash_pct={PYRAMID_ADD_BANKROLL_PCT} btc_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} lev={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD}"
         )
         if LIVE_TRADING:
@@ -3318,7 +3517,9 @@ class Bot:
         found = 0
         with self.store.lock:
             state_range = self.store.state.get("range", {})
-            state_pyramid = self.store.state.get("pyramid", {})
+            state_pyramid = {}
+            state_pyramid.update(self.store.state.get("pyramid", {}))
+            state_pyramid.update(self.store.state.get("pyramid_grids", {}))
             legacy_owners = dict(self.store.state.get("symbol_owner", {}))
 
         logical: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
@@ -3350,7 +3551,7 @@ class Bot:
             for side, q in grouped.items():
                 ventry = weighted_entry.get(side, D(0)) / q if q > 0 else D(0)
                 add_logical(
-                    symbol, side, f"RANGE:{symbol}", q,
+                    symbol, side, str((rst or {}).get("strategy") or f"RANGE:{symbol}"), q,
                     basket.get("recovery_tp_price") or basket.get("tp_price") or "-",
                     basket.get("hard_stop_price") or "-",
                     basket.get("alternations", 0),
