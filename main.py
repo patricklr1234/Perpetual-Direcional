@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.27.5-v59.5-bankroll-runtime-retry"
+VERSION = "8.28.0-v60-capital-efficient-margin"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -235,6 +235,8 @@ SCALPER_RECOVERY_MULTIPLIERS = tuple(
     D(x.strip()) for x in os.getenv("SCALPER_RECOVERY_MULTIPLIERS", "1,1.25,1.50,1.75,2.00").split(",") if x.strip()
 )
 SCALPER_RECOVERY_MAX_LEVEL = max(0, len(SCALPER_RECOVERY_MULTIPLIERS) - 1)
+SCALPER_DYNAMIC_RECOVERY_ENABLED = os.getenv("SCALPER_DYNAMIC_RECOVERY_ENABLED", "1") == "1"
+SCALPER_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER = D(os.getenv("SCALPER_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER", "1.10"))
 SCALPER_RECOVERY_SCORE_STEP = D(os.getenv("SCALPER_RECOVERY_SCORE_STEP", "0.03"))
 SCALPER_RECOVERY_DEPTH_STEP = D(os.getenv("SCALPER_RECOVERY_DEPTH_STEP", "0.02"))
 SCALPER_RECOVERY_TAPE_STEP = D(os.getenv("SCALPER_RECOVERY_TAPE_STEP", "0.015"))
@@ -364,6 +366,7 @@ def validate_runtime_config() -> None:
     require(len(SCALPER_RECOVERY_MULTIPLIERS) >= 1 and SCALPER_RECOVERY_MULTIPLIERS[0] == D(1), "SCALPER recovery deve iniciar em 1x")
     require(all(x >= D(1) for x in SCALPER_RECOVERY_MULTIPLIERS), "SCALPER recovery multipliers devem ser >=1")
     require(all(SCALPER_RECOVERY_MULTIPLIERS[i] <= SCALPER_RECOVERY_MULTIPLIERS[i+1] for i in range(len(SCALPER_RECOVERY_MULTIPLIERS)-1)), "SCALPER recovery multipliers devem ser nao-decrescentes")
+    require(SCALPER_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER >= D(1), f"SCALPER_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER deve ser >=1, atual={SCALPER_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER}")
     require(SCALPER_RECOVERY_MULTIPLIERS[-1] <= D(3), "SCALPER recovery max acima de 3x nao permitido nesta arquitetura")
     require(D(0) <= SCALPER_RECOVERY_SCORE_STEP < D(1) and D(0) <= SCALPER_RECOVERY_DEPTH_STEP < D(1) and D(0) <= SCALPER_RECOVERY_TAPE_STEP < D(1), "SCALPER recovery signal steps invalidos")
     require(SCALPER_RECOVERY_CONFIRM_STEP_SECONDS >= 0 and SCALPER_RECOVERY_COOLDOWN_STEP_SECONDS >= 0, "SCALPER recovery timing invalido")
@@ -4412,6 +4415,35 @@ class ScalperEngine:
         lvl = self._recovery_level() if level is None else max(0, min(int(level), SCALPER_RECOVERY_MAX_LEVEL))
         return SCALPER_RECOVERY_MULTIPLIERS[lvl]
 
+    def _capital_efficient_recovery_multiplier(self, target_pct: Decimal) -> Decimal:
+        """Size recovery from the actual deficit/TP edge instead of a fixed staircase.
+
+        Recovery level still tightens signal quality/timing. Position size is bounded by
+        the existing multiplier for the current recovery level, liquidity, physical margin and stop-risk.
+        """
+        st = self.st()
+        if not SCALPER_DYNAMIC_RECOVERY_ENABLED:
+            return self._recovery_multiplier()
+        deficit = max(D(0), dec(st.get("recovery_deficit")))
+        if deficit <= 0:
+            return D(1)
+        base = configured_scalper_initial_notional(self.symbol)
+        if base <= 0:
+            return D(1)
+        net_yield = dec(target_pct) - SCALPER_MAKER_FEE_RATE - SCALPER_TAKER_FEE_RATE
+        if net_yield <= 0:
+            return self._recovery_multiplier()
+        # Recover the actual deficit plus one normal base-trade net profit, with a small
+        # safety cushion for fill/fee variance. Never exceed the prior architecture's
+        # current-level multiplier, so this change can only reduce or preserve recovery size.
+        normal_profit = base * net_yield
+        required_notional = ((deficit + normal_profit) / net_yield) * SCALPER_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER
+        raw_mult = required_notional / base
+        # Never consume more margin than the old fixed staircase would use at
+        # this recovery level. Dynamic sizing may only reduce or preserve exposure.
+        max_mult = self._recovery_multiplier()
+        return max(D(1), min(max_mult, raw_mult))
+
     def _compound_multiplier(self) -> Decimal:
         st = self.st()
         if not SCALPER_COMPOUND_ENABLED or dec(st.get("recovery_deficit")) > 0:
@@ -4476,12 +4508,12 @@ class ScalperEngine:
         depth = dec(snap.get("bid_depth_usd" if side == "LONG" else "ask_depth_usd"))
         return max(D(0), depth * SCALPER_MAX_BOOK_PARTICIPATION)
 
-    def _sizing(self, price: Decimal, stop_pct: Decimal, side: str, snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _sizing(self, price: Decimal, target_pct: Decimal, stop_pct: Decimal, side: str, snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         st = self.st(); eq = dec(st.get("equity"), str(configured_scalper_bankroll(self.symbol)))
         if eq <= 0: return None
 
         level = self._recovery_level()
-        recovery_mult = self._recovery_multiplier(level)
+        recovery_mult = self._capital_efficient_recovery_multiplier(target_pct)
         compound_mult = self._compound_multiplier()
         base_notional = configured_scalper_initial_notional(self.symbol)
         desired_raw = base_notional * compound_mult * recovery_mult
@@ -4527,7 +4559,7 @@ class ScalperEngine:
         st["last_size_multiplier"] = str(compound_mult * recovery_mult)
         self.store.save()
         logger.info(
-            "SCALPER LIQUIDITY ENTRY OK | %s | side=%s desired_raw=%s desired_liq=%s actual=%s depth_usd=%s participation=%s projected_exit_slippage=%s recovery_level=%s recovery_mult=%sx compound_mult=%sx",
+            "SCALPER LIQUIDITY ENTRY OK | %s | side=%s desired_raw=%s desired_liq=%s actual=%s depth_usd=%s participation=%s projected_exit_slippage=%s recovery_level=%s recovery_mult_dynamic=%sx compound_mult=%sx",
             self.id, side, desired_raw, desired, actual, liq["depth_usd"], liq["participation"], liq["slippage_pct"], level, recovery_mult, compound_mult,
         )
         return {"leverage":lev,"qty":qty,"price":price,"notional":actual,"margin":actual/D(lev),
@@ -4597,6 +4629,7 @@ class ScalperEngine:
 
     def _finalize_close(self, pnl: Decimal, reason: str) -> None:
         st = self.st(); pnl = dec(pnl)
+        closed_target_pct = dec(((st.get("position") or {}).get("target_pct")))
         st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl)
         st["equity"] = str(configured_scalper_bankroll(self.symbol) + dec(st["realized_pnl"]))
         st["position"] = None; st["native_risk_stop"] = None; st["candidate_side"] = None; st["candidate_since"] = None
@@ -4628,7 +4661,8 @@ class ScalperEngine:
         st["recovery_level"] = level
         st["loss_streak"] = streak
         st["compound_multiplier"] = str(self._compound_multiplier())
-        st["last_size_multiplier"] = str(self._compound_multiplier() * self._recovery_multiplier(level))
+        next_recovery_mult = self._capital_efficient_recovery_multiplier(closed_target_pct) if closed_target_pct > 0 else self._recovery_multiplier(level)
+        st["last_size_multiplier"] = str(self._compound_multiplier() * next_recovery_mult)
 
         if dec(st.get("realized_pnl")) <= -SCALPER_MAX_LOSS_USD or dec(st.get("equity")) <= 0:
             st["stopped"] = True; st["stop_reason"] = f"SCALPER_MAX_LOSS reached realized={st['realized_pnl']}"
@@ -4636,7 +4670,7 @@ class ScalperEngine:
         logger.warning(
             "SCALPER RESULT | %s | pnl=%s realized=%s equity=%s RD=%s recovery_level=%s recovery_mult=%sx compound_mult=%sx streak=%s stopped=%s",
             self.id, pnl, st["realized_pnl"], st["equity"], st["recovery_deficit"], level,
-            self._recovery_multiplier(level), st["compound_multiplier"], streak, st.get("stopped"),
+            next_recovery_mult, st["compound_multiplier"], streak, st.get("stopped"),
         )
 
     def _close_market(self, ref: Decimal, reason: str) -> bool:
@@ -4724,7 +4758,7 @@ class ScalperEngine:
         st = self.st(); bid=dec(snap["bid"]); ask=dec(snap["ask"])
         rule = self.exe.rules.rules[self.symbol]
         maker_price = floor_step(bid, rule.tick_size) if side == "LONG" else ceil_step(ask, rule.tick_size)
-        sizing = self._sizing(maker_price, stop_pct, side, snap)
+        sizing = self._sizing(maker_price, target_pct, stop_pct, side, snap)
         if not sizing: return
         leg = self.exe.open_post_only_leg(self.id, self.symbol, side, sizing, maker_price, "SCALPER_BOOK_TAPE", SCALPER_POST_ONLY_WAIT_SECONDS)
         st["last_entry_attempt"] = time.time()
@@ -4759,7 +4793,7 @@ class ScalperEngine:
         if not snap: return {"status":"WAITING_MICRODATA"}
         side,target,stop,score,why=self._signal(snap)
         return {"status":"READY" if side else "WAITING_SIGNAL","side":side,"reason":why,"score":score,"spread":snap.get("spread_pct"),"range5":snap.get("range_5s"),"depth":snap.get("depth_imbalance"),"tape":snap.get("tape_imbalance"),"target_pct":target,"stop_pct":stop,
-                "recovery_level":st.get("recovery_level"),"RD":st.get("recovery_deficit"),"compound":self._compound_multiplier(),"size_mult":self._compound_multiplier()*self._recovery_multiplier()}
+                "recovery_level":st.get("recovery_level"),"RD":st.get("recovery_deficit"),"compound":self._compound_multiplier(),"size_mult":self._compound_multiplier()*self._capital_efficient_recovery_multiplier(target)}
 
     def tick(self, ref: Decimal) -> None:
         st=self.st()
@@ -5171,6 +5205,7 @@ def run_internal_regression_checks() -> None:
     assert SCALPER_MIN_TARGET_PCT > SCALPER_MAKER_FEE_RATE
     assert SCALPER_MAX_STOP_PCT >= SCALPER_MIN_STOP_PCT
     assert SCALPER_RECOVERY_MULTIPLIERS[0] == D(1) and SCALPER_RECOVERY_MULTIPLIERS[-1] <= D(3)
+    assert SCALPER_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER >= D(1)
     assert SCALPER_COMPOUND_MAX_MULTIPLIER >= D(1) and D(0) <= SCALPER_COMPOUND_PROFIT_SHARE <= D(1)
     assert D(0) < SCALPER_MAX_BOOK_PARTICIPATION <= D("0.25")
     assert D(0) < SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION <= D("0.50")
@@ -5184,7 +5219,7 @@ def run_internal_regression_checks() -> None:
     _apply_realized_pnl_to_state(_t2, D("0.75"), D("100"), "TEST_RECOVERY_PARTIAL")
     assert dec(_t2["recovery_deficit"]) == D("0.25")
     assert D("100") * D("0.05") * D("10") == D("50")
-    logger.info("SELF TEST | PASS | single-pyramid+micro-scalper/book-tape/post-only/native-risk-stop/progressive-recovery/compound/liquidity-aware-exit invariants")
+    logger.info("SELF TEST | PASS | single-pyramid/free-margin-add+micro-scalper/dynamic-recovery-margin/book-tape/post-only/native-risk-stop/compound/liquidity-aware-exit invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -5946,7 +5981,7 @@ class Bot:
         logger.info(f"SCALPER CAPITAL | bankroll BTC={BTC_SCALPER_BANKROLL_USD} ETH/HYPE={SCALPER_BANKROLL_USD} | notional BTC={BTC_SCALPER_INITIAL_NOTIONAL_USD} ETH/HYPE={SCALPER_INITIAL_NOTIONAL_USD} | lev={SCALPER_LEVERAGE}x")
         logger.info(f"SCALPER SIGNAL | spread_max={SCALPER_MAX_SPREAD_PCT} range5={SCALPER_MIN_RANGE_PCT}..{SCALPER_MAX_RANGE_PCT} score={SCALPER_SCORE_THRESHOLD} depth_min={SCALPER_MIN_DEPTH_IMBALANCE} tape_min={SCALPER_MIN_TAPE_IMBALANCE} confirm={SCALPER_SIGNAL_CONFIRM_SECONDS}s")
         logger.info(f"SCALPER EXIT/RISK | maker_fee={SCALPER_MAKER_FEE_RATE} taker_fee={SCALPER_TAKER_FEE_RATE} target={SCALPER_MIN_TARGET_PCT}..{SCALPER_MAX_TARGET_PCT} stop={SCALPER_MIN_STOP_PCT}..{SCALPER_MAX_STOP_PCT} hold_max={SCALPER_MAX_HOLD_SECONDS}s max_loss_bankroll={SCALPER_MAX_LOSS_USD}")
-        logger.info(f"SCALPER RECOVERY | multipliers={SCALPER_RECOVERY_MULTIPLIERS} signal_steps=score+{SCALPER_RECOVERY_SCORE_STEP}/depth+{SCALPER_RECOVERY_DEPTH_STEP}/tape+{SCALPER_RECOVERY_TAPE_STEP} confirm_step={SCALPER_RECOVERY_CONFIRM_STEP_SECONDS}s cooldown_step={SCALPER_RECOVERY_COOLDOWN_STEP_SECONDS}s pause={SCALPER_LOSS_PAUSE_AFTER_STREAK}loss/{SCALPER_LOSS_PAUSE_SECONDS}s")
+        logger.info(f"SCALPER RECOVERY | dynamic_margin={SCALPER_DYNAMIC_RECOVERY_ENABLED} safety={SCALPER_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER}x max_mult={SCALPER_RECOVERY_MULTIPLIERS[-1]}x level_steps={SCALPER_RECOVERY_MULTIPLIERS} signal_steps=score+{SCALPER_RECOVERY_SCORE_STEP}/depth+{SCALPER_RECOVERY_DEPTH_STEP}/tape+{SCALPER_RECOVERY_TAPE_STEP} confirm_step={SCALPER_RECOVERY_CONFIRM_STEP_SECONDS}s cooldown_step={SCALPER_RECOVERY_COOLDOWN_STEP_SECONDS}s pause={SCALPER_LOSS_PAUSE_AFTER_STREAK}loss/{SCALPER_LOSS_PAUSE_SECONDS}s")
         logger.info(f"SCALPER COMPOUND | enabled={SCALPER_COMPOUND_ENABLED} reinvest_profit_share={SCALPER_COMPOUND_PROFIT_SHARE} max_mult={SCALPER_COMPOUND_MAX_MULTIPLIER}x | disabled_during_recovery=True")
         logger.info(f"SCALPER LIQUIDITY | entry_max_top20_participation={SCALPER_MAX_BOOK_PARTICIPATION} exit_chunk_participation={SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION} max_projected_slippage={SCALPER_MAX_EXIT_SLIPPAGE_PCT} max_chunks={SCALPER_MAX_EXIT_CHUNKS}")
         logger.info(f"NEWS 3-STAR={NEWS_FILTER_ENABLED} | janela=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | fail_closed={NEWS_FAIL_CLOSED}")
@@ -6283,7 +6318,7 @@ class Bot:
             f"news={news_health} source={news_source} events={news_events} age_s={news_age} fail_closed={NEWS_FAIL_CLOSED} window=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | "
             f"range=False legacy_range_engines={len(self.range_engines)} | "
             f"pyramid={PYRAMID_ENGINE_ENABLED} architecture=SINGLE bankroll_logico={PYRAMID_BANKROLL_USD} initial={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT} btc_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} lev={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} native_risk_stop={PYRAMID_NATIVE_RISK_STOP} | "
-            f"scalper={SCALPER_ENGINE_ENABLED} bankroll={SCALPER_BANKROLL_USD}/BTC={BTC_SCALPER_BANKROLL_USD} maker_entry=GTX analysis=BOOK+TAPE+MICROPRICE target={SCALPER_MIN_TARGET_PCT}..{SCALPER_MAX_TARGET_PCT} stop={SCALPER_MIN_STOP_PCT}..{SCALPER_MAX_STOP_PCT} max_loss={SCALPER_MAX_LOSS_USD} recovery={SCALPER_RECOVERY_MULTIPLIERS} compound={SCALPER_COMPOUND_ENABLED}/{SCALPER_COMPOUND_PROFIT_SHARE}/max{SCALPER_COMPOUND_MAX_MULTIPLIER} liquidity_entry={SCALPER_MAX_BOOK_PARTICIPATION} liquidity_exit={SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION}"
+            f"scalper={SCALPER_ENGINE_ENABLED} bankroll={SCALPER_BANKROLL_USD}/BTC={BTC_SCALPER_BANKROLL_USD} maker_entry=GTX analysis=BOOK+TAPE+MICROPRICE target={SCALPER_MIN_TARGET_PCT}..{SCALPER_MAX_TARGET_PCT} stop={SCALPER_MIN_STOP_PCT}..{SCALPER_MAX_STOP_PCT} max_loss={SCALPER_MAX_LOSS_USD} recovery_dynamic={SCALPER_DYNAMIC_RECOVERY_ENABLED}/safety{SCALPER_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER}/max{SCALPER_RECOVERY_MULTIPLIERS[-1]} compound={SCALPER_COMPOUND_ENABLED}/{SCALPER_COMPOUND_PROFIT_SHARE}/max{SCALPER_COMPOUND_MAX_MULTIPLIER} liquidity_entry={SCALPER_MAX_BOOK_PARTICIPATION} liquidity_exit={SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION}"
         )
         if LIVE_TRADING:
             try:
