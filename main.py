@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.27.3-v59.3-bankroll-reset"
+VERSION = "8.27.4-v59.4-bankroll-reset-fix"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -112,12 +112,13 @@ VALIDATE_API_ONLY = os.getenv("VALIDATE_API_ONLY", "0") == "1"
 EMERGENCY_CLOSE_ALL_AND_RESET = os.getenv("EMERGENCY_CLOSE_ALL_AND_RESET", "0") == "1"
 EMERGENCY_RESET_ID = os.getenv("EMERGENCY_RESET_ID", "reset-20260830-01").strip()
 
-# One-shot logical bankroll reset requested for strategies that already stopped because
-# their own loss budget was exhausted. This never closes/cancels exchange exposure and
-# never resets an active strategy. A durable marker prevents the reset from becoming an
-# automatic "forgive every future loss on restart" mechanism.
+# One-shot logical bankroll reset requested for legacy/loss-carrying strategies.
+# A strategy is reset only when it is FLAT and carries negative realized PnL/equity below
+# its configured initial bankroll, or is stopped specifically by its own loss budget.
+# This never closes/cancels exchange exposure and never resets an active strategy. A
+# durable marker prevents the reset from becoming an automatic future-loss forgiveness.
 RESET_BROKEN_BANKROLLS_ON_STARTUP = os.getenv("RESET_BROKEN_BANKROLLS_ON_STARTUP", "1") == "1"
-BROKEN_BANKROLL_RESET_ID = os.getenv("BROKEN_BANKROLL_RESET_ID", "bankroll-reset-20260908-01").strip()
+BROKEN_BANKROLL_RESET_ID = os.getenv("BROKEN_BANKROLL_RESET_ID", "bankroll-reset-20260908-02").strip()
 BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
 BOT_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = BOT_DIR / "state.json"
@@ -5242,14 +5243,19 @@ class Bot:
         return False
 
     def reset_broken_bankrolls_to_initial(self) -> None:
-        """One-shot reset of *flat* strategies that stopped because of their loss budget.
+        """One-shot reset of safe, FLAT strategies carrying prior logical losses.
+
+        Reset candidates:
+          - negative realized PnL; or
+          - logical equity below the configured initial bankroll; or
+          - a strategy stopped specifically by its own loss budget.
 
         Safety properties:
-          - requires LIVE_TRADING and a successful startup reconciliation before this call;
+          - requires LIVE_TRADING and successful startup reconciliation before this call;
           - never touches exchange orders/positions or the durable fill ledger;
-          - refuses any strategy that still has state or ledger exposure;
-          - does not clear operational/protection failures unrelated to bankroll loss;
-          - writes a durable completion marker so future losses are not auto-reset on restart.
+          - never resets a strategy with state/ledger/native-stop exposure;
+          - never clears operational/protection stops unrelated to bankroll loss;
+          - completion is durable, so future losses are NOT forgiven on restart.
         """
         if not RESET_BROKEN_BANKROLLS_ON_STARTUP:
             logger.info("BANKROLL RESET | disabled by configuration")
@@ -5267,17 +5273,31 @@ class Bot:
         skipped_records: List[Dict[str, Any]] = []
 
         with self.store.lock:
-            # PYRAMID: reset only the current SINGLE/LEGACY strategies. Old drain-only G0
-            # states are intentionally excluded from this user-requested fresh bankroll.
+            # PYRAMID: include FLAT strategies with stale/negative realized bankroll even
+            # when they were never marked stopped by the older architecture.
             for key, st in self.store.state.get("pyramid", {}).items():
-                if not isinstance(st, dict) or not st.get("stopped"):
+                if not isinstance(st, dict):
                     continue
                 strategy_id = str(st.get("strategy") or f"PYRAMID:{key}")
                 symbol = str(st.get("symbol") or "").upper()
                 side = str(st.get("side") or "").upper()
+                share = dec(st.get("capital_share", "1"))
+                bankroll = PYRAMID_BANKROLL_USD * share
+                realized = dec(st.get("realized_pnl"))
+                equity = dec(st.get("equity"), bankroll)
+                stopped = bool(st.get("stopped"))
                 reason = str(st.get("stop_reason") or "")
-                if not self._loss_stop_reason_allows_bankroll_reset("PYRAMID", reason):
-                    skipped_records.append({"strategy": strategy_id, "reason": "STOP_REASON_NOT_LOSS_RESETTABLE", "stop_reason": reason})
+                loss_stop = stopped and self._loss_stop_reason_allows_bankroll_reset("PYRAMID", reason)
+                carries_loss = realized < 0 or equity < bankroll
+                if not (carries_loss or loss_stop):
+                    continue
+                # Operational/protection stops are not silently cleared even if they also
+                # happen to carry a loss. They require explicit operational resolution.
+                if stopped and not loss_stop:
+                    skipped_records.append({
+                        "strategy": strategy_id, "reason": "NON_LOSS_STOP_REQUIRES_MANUAL",
+                        "stop_reason": reason, "realized_pnl": str(realized), "equity": str(equity),
+                    })
                     continue
                 state_qty = sum((dec(x.get("qty")) for x in (st.get("legs") or []) if isinstance(x, dict)), D(0))
                 ledger_qty = self.ledger.open_strategy_qty(strategy_id, symbol, side) if symbol and side else D(0)
@@ -5286,6 +5306,7 @@ class Bot:
                         "strategy": strategy_id, "reason": "EXPOSURE_STILL_OPEN",
                         "state_qty": str(state_qty), "ledger_qty": str(ledger_qty),
                         "native_stop": bool(st.get("native_risk_stop")),
+                        "realized_pnl": str(realized), "equity": str(equity),
                     })
                     continue
 
@@ -5294,8 +5315,6 @@ class Bot:
                     "realized_pnl": str(st.get("realized_pnl", "0")),
                     "stop_reason": reason,
                 }
-                share = dec(st.get("capital_share", "1"))
-                bankroll = PYRAMID_BANKROLL_USD * share
                 st["bankroll"] = str(bankroll)
                 st["equity"] = str(bankroll)
                 st["realized_pnl"] = "0"
@@ -5314,16 +5333,26 @@ class Bot:
                     "previous": previous,
                 })
 
-            # SCALPER: reset its economic/recovery state only when no live leg remains.
-            # Lifetime win/loss/trade counters are preserved for auditability.
+            # SCALPER: same migration rule, while preserving lifetime trade counters.
             for symbol_key, st in self.store.state.get("scalper", {}).items():
-                if not isinstance(st, dict) or not st.get("stopped"):
+                if not isinstance(st, dict):
                     continue
                 strategy_id = str(st.get("strategy") or f"SCALPER:{symbol_key}")
                 symbol = str(st.get("symbol") or symbol_key).upper()
+                bankroll = configured_scalper_bankroll(symbol)
+                realized = dec(st.get("realized_pnl"))
+                equity = dec(st.get("equity"), bankroll)
+                stopped = bool(st.get("stopped"))
                 reason = str(st.get("stop_reason") or "")
-                if not self._loss_stop_reason_allows_bankroll_reset("SCALPER", reason):
-                    skipped_records.append({"strategy": strategy_id, "reason": "STOP_REASON_NOT_LOSS_RESETTABLE", "stop_reason": reason})
+                loss_stop = stopped and self._loss_stop_reason_allows_bankroll_reset("SCALPER", reason)
+                carries_loss = realized < 0 or equity < bankroll or dec(st.get("recovery_deficit")) > 0
+                if not (carries_loss or loss_stop):
+                    continue
+                if stopped and not loss_stop:
+                    skipped_records.append({
+                        "strategy": strategy_id, "reason": "NON_LOSS_STOP_REQUIRES_MANUAL",
+                        "stop_reason": reason, "realized_pnl": str(realized), "equity": str(equity),
+                    })
                     continue
                 pos = st.get("position") or {}
                 leg = pos.get("leg") if isinstance(pos, dict) else None
@@ -5335,6 +5364,7 @@ class Bot:
                         "strategy": strategy_id, "reason": "EXPOSURE_STILL_OPEN",
                         "state_qty": str(state_qty), "ledger_qty": str(ledger_qty),
                         "native_stop": bool(st.get("native_risk_stop")),
+                        "realized_pnl": str(realized), "equity": str(equity),
                     })
                     continue
 
@@ -5344,7 +5374,6 @@ class Bot:
                     "recovery_deficit": str(st.get("recovery_deficit", "0")),
                     "stop_reason": reason,
                 }
-                bankroll = configured_scalper_bankroll(symbol)
                 st["bankroll"] = str(bankroll)
                 st["equity"] = str(bankroll)
                 st["realized_pnl"] = "0"
@@ -5368,6 +5397,8 @@ class Bot:
                     "previous": previous,
                 })
 
+            # Only unresolved eligible exposure keeps this migration pending. Operational
+            # non-loss stops are intentionally outside the economic reset contract.
             pending_exposure = any(rec.get("reason") == "EXPOSURE_STILL_OPEN" for rec in skipped_records)
             maintenance = self.store.state.setdefault("maintenance", {})
             maintenance["broken_bankroll_reset"] = {
@@ -5377,7 +5408,7 @@ class Bot:
                 "last_attempt_at": now_iso(),
                 "reset_strategies": reset_records,
                 "skipped_strategies": skipped_records,
-                "policy": "ONLY_FLAT_LOSS_STOPPED_STRATEGIES; NO_EXCHANGE_OR_LEDGER_MUTATION",
+                "policy": "FLAT_NEGATIVE_REALIZED_OR_LOSS_STOPPED; NO_EXCHANGE_OR_LEDGER_MUTATION",
             }
             self.store.save()
 
@@ -5818,7 +5849,7 @@ class Bot:
         logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} | SCALPER={SCALPER_ENGINE_ENABLED} analysis=BOOK+TAPE+MICROPRICE")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
         logger.info(f"PYRAMID CAPITAL | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT}")
-        logger.info(f"BANKROLL RESET | enabled={RESET_BROKEN_BANKROLLS_ON_STARTUP} id={BROKEN_BANKROLL_RESET_ID} mode=ONE_SHOT_FLAT_LOSS_STOPPED_ONLY")
+        logger.info(f"BANKROLL RESET | enabled={RESET_BROKEN_BANKROLLS_ON_STARTUP} id={BROKEN_BANKROLL_RESET_ID} mode=ONE_SHOT_FLAT_NEGATIVE_REALIZED_OR_LOSS_STOPPED")
         logger.info(f"PYRAMID RISK | step={PYRAMID_STEP_PCT} target_leverage={PYRAMID_LEVERAGE}x effective_leverage_cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} fee_model_taker={TAKER_FEE_RATE} | pre_v56_one_shot_retire={RETIRE_PRE_V56_PYRAMID_ON_STARTUP} | legacy_overleverage_flag={NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP}")
         logger.info(f"SCALPER CAPITAL | bankroll BTC={BTC_SCALPER_BANKROLL_USD} ETH/HYPE={SCALPER_BANKROLL_USD} | notional BTC={BTC_SCALPER_INITIAL_NOTIONAL_USD} ETH/HYPE={SCALPER_INITIAL_NOTIONAL_USD} | lev={SCALPER_LEVERAGE}x")
         logger.info(f"SCALPER SIGNAL | spread_max={SCALPER_MAX_SPREAD_PCT} range5={SCALPER_MIN_RANGE_PCT}..{SCALPER_MAX_RANGE_PCT} score={SCALPER_SCORE_THRESHOLD} depth_min={SCALPER_MIN_DEPTH_IMBALANCE} tape_min={SCALPER_MIN_TAPE_IMBALANCE} confirm={SCALPER_SIGNAL_CONFIRM_SECONDS}s")
