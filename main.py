@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.27.1-v59.1-scalper-recovery-compound-liquidity"
+VERSION = "8.27.3-v59.3-bankroll-reset"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -111,6 +111,13 @@ LIVE_TRADING = os.getenv("LIVE_TRADING", "0") == "1"
 VALIDATE_API_ONLY = os.getenv("VALIDATE_API_ONLY", "0") == "1"
 EMERGENCY_CLOSE_ALL_AND_RESET = os.getenv("EMERGENCY_CLOSE_ALL_AND_RESET", "0") == "1"
 EMERGENCY_RESET_ID = os.getenv("EMERGENCY_RESET_ID", "reset-20260830-01").strip()
+
+# One-shot logical bankroll reset requested for strategies that already stopped because
+# their own loss budget was exhausted. This never closes/cancels exchange exposure and
+# never resets an active strategy. A durable marker prevents the reset from becoming an
+# automatic "forgive every future loss on restart" mechanism.
+RESET_BROKEN_BANKROLLS_ON_STARTUP = os.getenv("RESET_BROKEN_BANKROLLS_ON_STARTUP", "1") == "1"
+BROKEN_BANKROLL_RESET_ID = os.getenv("BROKEN_BANKROLL_RESET_ID", "bankroll-reset-20260908-01").strip()
 BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
 BOT_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = BOT_DIR / "state.json"
@@ -340,6 +347,8 @@ def validate_runtime_config() -> None:
     require(PROTECTIVE_WORKING_TYPE in ("MARK_PRICE", "CONTRACT_PRICE"), f"PROTECTIVE_WORKING_TYPE invalido: {PROTECTIVE_WORKING_TYPE}")
     require(D(0) <= TAKER_FEE_RATE < D("0.01"), f"TAKER_FEE_RATE invalida: {TAKER_FEE_RATE}")
     require(SCALPER_BANKROLL_USD > 0 and BTC_SCALPER_BANKROLL_USD > 0, "SCALPER bankrolls devem ser >0")
+    require((not RESET_BROKEN_BANKROLLS_ON_STARTUP) or bool(BROKEN_BANKROLL_RESET_ID),
+            "BROKEN_BANKROLL_RESET_ID nao pode ser vazio quando RESET_BROKEN_BANKROLLS_ON_STARTUP=1")
     require(SCALPER_INITIAL_NOTIONAL_USD > 0 and BTC_SCALPER_INITIAL_NOTIONAL_USD > 0, "SCALPER notionals devem ser >0")
     require(1 <= SCALPER_LEVERAGE <= PYRAMID_MAX_EFFECTIVE_LEVERAGE, f"SCALPER_LEVERAGE deve respeitar cap compartilhado {PYRAMID_MAX_EFFECTIVE_LEVERAGE}x")
     require(D(0) <= SCALPER_MAKER_FEE_RATE < D("0.01") and D(0) <= SCALPER_TAKER_FEE_RATE < D("0.01"), "SCALPER fees invalidas")
@@ -5209,6 +5218,183 @@ class Bot:
         ] if SCALPER_ENGINE_ENABLED else []
         self.last_hb = 0.0
 
+    def _broken_bankroll_reset_completed(self) -> bool:
+        with self.store.lock:
+            maintenance = self.store.state.get("maintenance", {}) or {}
+            rec = maintenance.get("broken_bankroll_reset", {}) or {}
+            return bool(
+                isinstance(rec, dict)
+                and rec.get("completed")
+                and str(rec.get("id") or "") == BROKEN_BANKROLL_RESET_ID
+            )
+
+    @staticmethod
+    def _loss_stop_reason_allows_bankroll_reset(strategy_kind: str, stop_reason: Any) -> bool:
+        reason = str(stop_reason or "").upper()
+        if strategy_kind == "PYRAMID":
+            return any(token in reason for token in (
+                "PYRAMID_MAX_LOSS",
+                "NATIVE_RISK_STOP_FILLED",
+                "PYRAMID_LIQUIDATION_GUARD",
+            ))
+        if strategy_kind == "SCALPER":
+            return "SCALPER_MAX_LOSS" in reason
+        return False
+
+    def reset_broken_bankrolls_to_initial(self) -> None:
+        """One-shot reset of *flat* strategies that stopped because of their loss budget.
+
+        Safety properties:
+          - requires LIVE_TRADING and a successful startup reconciliation before this call;
+          - never touches exchange orders/positions or the durable fill ledger;
+          - refuses any strategy that still has state or ledger exposure;
+          - does not clear operational/protection failures unrelated to bankroll loss;
+          - writes a durable completion marker so future losses are not auto-reset on restart.
+        """
+        if not RESET_BROKEN_BANKROLLS_ON_STARTUP:
+            logger.info("BANKROLL RESET | disabled by configuration")
+            return
+        if not LIVE_TRADING:
+            logger.info("BANKROLL RESET | simulation/validation mode; one-shot reset deferred")
+            return
+        if not BROKEN_BANKROLL_RESET_ID:
+            raise RuntimeError("BROKEN_BANKROLL_RESET_ID vazio com RESET_BROKEN_BANKROLLS_ON_STARTUP=1")
+        if self._broken_bankroll_reset_completed():
+            logger.info("BANKROLL RESET | id=%s already completed; skip", BROKEN_BANKROLL_RESET_ID)
+            return
+
+        reset_records: List[Dict[str, Any]] = []
+        skipped_records: List[Dict[str, Any]] = []
+
+        with self.store.lock:
+            # PYRAMID: reset only the current SINGLE/LEGACY strategies. Old drain-only G0
+            # states are intentionally excluded from this user-requested fresh bankroll.
+            for key, st in self.store.state.get("pyramid", {}).items():
+                if not isinstance(st, dict) or not st.get("stopped"):
+                    continue
+                strategy_id = str(st.get("strategy") or f"PYRAMID:{key}")
+                symbol = str(st.get("symbol") or "").upper()
+                side = str(st.get("side") or "").upper()
+                reason = str(st.get("stop_reason") or "")
+                if not self._loss_stop_reason_allows_bankroll_reset("PYRAMID", reason):
+                    skipped_records.append({"strategy": strategy_id, "reason": "STOP_REASON_NOT_LOSS_RESETTABLE", "stop_reason": reason})
+                    continue
+                state_qty = sum((dec(x.get("qty")) for x in (st.get("legs") or []) if isinstance(x, dict)), D(0))
+                ledger_qty = self.ledger.open_strategy_qty(strategy_id, symbol, side) if symbol and side else D(0)
+                if state_qty > 0 or ledger_qty > 0 or st.get("native_risk_stop"):
+                    skipped_records.append({
+                        "strategy": strategy_id, "reason": "EXPOSURE_STILL_OPEN",
+                        "state_qty": str(state_qty), "ledger_qty": str(ledger_qty),
+                        "native_stop": bool(st.get("native_risk_stop")),
+                    })
+                    continue
+
+                previous = {
+                    "equity": str(st.get("equity", "0")),
+                    "realized_pnl": str(st.get("realized_pnl", "0")),
+                    "stop_reason": reason,
+                }
+                share = dec(st.get("capital_share", "1"))
+                bankroll = PYRAMID_BANKROLL_USD * share
+                st["bankroll"] = str(bankroll)
+                st["equity"] = str(bankroll)
+                st["realized_pnl"] = "0"
+                st["last_unrealized"] = "0"
+                st["last_net_pnl"] = "0"
+                st["stopped"] = False
+                st["stop_reason"] = None
+                st["anchor"] = None
+                st["next_level"] = 1
+                st["levels_filled"] = 0
+                st["last_trigger_price"] = None
+                st["native_risk_stop"] = None
+                st["last_update"] = now_iso()
+                reset_records.append({
+                    "strategy": strategy_id, "kind": "PYRAMID", "bankroll": str(bankroll),
+                    "previous": previous,
+                })
+
+            # SCALPER: reset its economic/recovery state only when no live leg remains.
+            # Lifetime win/loss/trade counters are preserved for auditability.
+            for symbol_key, st in self.store.state.get("scalper", {}).items():
+                if not isinstance(st, dict) or not st.get("stopped"):
+                    continue
+                strategy_id = str(st.get("strategy") or f"SCALPER:{symbol_key}")
+                symbol = str(st.get("symbol") or symbol_key).upper()
+                reason = str(st.get("stop_reason") or "")
+                if not self._loss_stop_reason_allows_bankroll_reset("SCALPER", reason):
+                    skipped_records.append({"strategy": strategy_id, "reason": "STOP_REASON_NOT_LOSS_RESETTABLE", "stop_reason": reason})
+                    continue
+                pos = st.get("position") or {}
+                leg = pos.get("leg") if isinstance(pos, dict) else None
+                state_qty = dec((leg or {}).get("qty")) if isinstance(leg, dict) else D(0)
+                side = str((leg or {}).get("side") or "").upper() if isinstance(leg, dict) else ""
+                ledger_qty = self.ledger.open_strategy_qty(strategy_id, symbol, side) if side else D(0)
+                if state_qty > 0 or ledger_qty > 0 or st.get("native_risk_stop"):
+                    skipped_records.append({
+                        "strategy": strategy_id, "reason": "EXPOSURE_STILL_OPEN",
+                        "state_qty": str(state_qty), "ledger_qty": str(ledger_qty),
+                        "native_stop": bool(st.get("native_risk_stop")),
+                    })
+                    continue
+
+                previous = {
+                    "equity": str(st.get("equity", "0")),
+                    "realized_pnl": str(st.get("realized_pnl", "0")),
+                    "recovery_deficit": str(st.get("recovery_deficit", "0")),
+                    "stop_reason": reason,
+                }
+                bankroll = configured_scalper_bankroll(symbol)
+                st["bankroll"] = str(bankroll)
+                st["equity"] = str(bankroll)
+                st["realized_pnl"] = "0"
+                st["position"] = None
+                st["native_risk_stop"] = None
+                st["stopped"] = False
+                st["stop_reason"] = None
+                st["loss_streak"] = 0
+                st["recovery_level"] = 0
+                st["recovery_deficit"] = "0"
+                st["pause_until"] = 0
+                st["compound_multiplier"] = "1"
+                st["last_size_multiplier"] = "1"
+                st["candidate_side"] = None
+                st["candidate_since"] = None
+                st["last_entry_attempt"] = 0
+                st["last_result"] = "BANKROLL_RESET_TO_INITIAL"
+                st["last_update"] = now_iso()
+                reset_records.append({
+                    "strategy": strategy_id, "kind": "SCALPER", "bankroll": str(bankroll),
+                    "previous": previous,
+                })
+
+            pending_exposure = any(rec.get("reason") == "EXPOSURE_STILL_OPEN" for rec in skipped_records)
+            maintenance = self.store.state.setdefault("maintenance", {})
+            maintenance["broken_bankroll_reset"] = {
+                "id": BROKEN_BANKROLL_RESET_ID,
+                "completed": not pending_exposure,
+                "completed_at": now_iso() if not pending_exposure else None,
+                "last_attempt_at": now_iso(),
+                "reset_strategies": reset_records,
+                "skipped_strategies": skipped_records,
+                "policy": "ONLY_FLAT_LOSS_STOPPED_STRATEGIES; NO_EXCHANGE_OR_LEDGER_MUTATION",
+            }
+            self.store.save()
+
+        for rec in reset_records:
+            logger.warning(
+                "BANKROLL RESET | id=%s | strategy=%s kind=%s bankroll=%s previous=%s",
+                BROKEN_BANKROLL_RESET_ID, rec["strategy"], rec["kind"], rec["bankroll"], rec["previous"],
+            )
+        for rec in skipped_records:
+            logger.warning("BANKROLL RESET SKIP | id=%s | %s", BROKEN_BANKROLL_RESET_ID, rec)
+        pending = any(rec.get("reason") == "EXPOSURE_STILL_OPEN" for rec in skipped_records)
+        logger.warning(
+            "BANKROLL RESET %s | id=%s | reset=%s skipped=%s | future losses remain stop-on-loss",
+            "PENDING_EXPOSURE" if pending else "COMPLETE",
+            BROKEN_BANKROLL_RESET_ID, len(reset_records), len(skipped_records),
+        )
+
     def _apply_leverage_retire_close_to_state(self, symbol: str, side: str, leg_id: str, pnl_delta: Decimal) -> None:
         """Reflect one confirmed leverage-normalization close into persistent strategy state."""
         symbol = str(symbol).upper(); side = str(side).upper(); leg_id = str(leg_id)
@@ -5632,6 +5818,7 @@ class Bot:
         logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} | SCALPER={SCALPER_ENGINE_ENABLED} analysis=BOOK+TAPE+MICROPRICE")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
         logger.info(f"PYRAMID CAPITAL | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT}")
+        logger.info(f"BANKROLL RESET | enabled={RESET_BROKEN_BANKROLLS_ON_STARTUP} id={BROKEN_BANKROLL_RESET_ID} mode=ONE_SHOT_FLAT_LOSS_STOPPED_ONLY")
         logger.info(f"PYRAMID RISK | step={PYRAMID_STEP_PCT} target_leverage={PYRAMID_LEVERAGE}x effective_leverage_cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} fee_model_taker={TAKER_FEE_RATE} | pre_v56_one_shot_retire={RETIRE_PRE_V56_PYRAMID_ON_STARTUP} | legacy_overleverage_flag={NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP}")
         logger.info(f"SCALPER CAPITAL | bankroll BTC={BTC_SCALPER_BANKROLL_USD} ETH/HYPE={SCALPER_BANKROLL_USD} | notional BTC={BTC_SCALPER_INITIAL_NOTIONAL_USD} ETH/HYPE={SCALPER_INITIAL_NOTIONAL_USD} | lev={SCALPER_LEVERAGE}x")
         logger.info(f"SCALPER SIGNAL | spread_max={SCALPER_MAX_SPREAD_PCT} range5={SCALPER_MIN_RANGE_PCT}..{SCALPER_MAX_RANGE_PCT} score={SCALPER_SCORE_THRESHOLD} depth_min={SCALPER_MIN_DEPTH_IMBALANCE} tape_min={SCALPER_MIN_TAPE_IMBALANCE} confirm={SCALPER_SIGNAL_CONFIRM_SECONDS}s")
@@ -5674,6 +5861,9 @@ class Bot:
             if EMERGENCY_CLOSE_ALL_AND_RESET:
                 self.emergency_close_all_and_reset()
             self.reconciler.reconcile()
+            # User-requested one-shot reset of bankrolls that already broke. This runs
+            # only after ledger/state/physical reconciliation has succeeded.
+            self.reset_broken_bankrolls_to_initial()
         else:
             logger.warning("MODO SIMULACAO: nenhuma ordem real sera enviada")
 
@@ -5978,6 +6168,12 @@ class Bot:
                 logger.warning(f"OPEN POSITION DETAIL FAIL | {e}")
 
     def log_open_positions_detailed(self) -> None:
+        """Log physical positions with strategy ownership and strategy-specific progress.
+
+        PYRAMID ladder depth is reported as pyramid_level, never as recovery_level.
+        SCALPER positions are included in ownership attribution and retain their real
+        progressive-recovery/compound size multiplier in diagnostics.
+        """
         positions = self.client.positions()
         found = 0
         with self.store.lock:
@@ -5992,7 +6188,8 @@ class Bot:
 
         def add_logical(symbol: str, side: str, strategy: str, vqty: Decimal,
                         target: Any = "-", stop: Any = "-", recovery: Any = "-",
-                        virtual_entry: Any = "-") -> None:
+                        virtual_entry: Any = "-", size_multiplier: Any = "-",
+                        pyramid_level: Any = "-") -> None:
             symbol = str(symbol).upper()
             side = str(side).upper()
             if symbol not in SYMBOLS or side not in ("LONG", "SHORT") or vqty <= 0:
@@ -6000,8 +6197,10 @@ class Bot:
             logical.setdefault((symbol, side), []).append({
                 "strategy": strategy, "qty": vqty, "target": target,
                 "stop": stop, "recovery": recovery, "entry": virtual_entry,
+                "size_multiplier": size_multiplier, "pyramid_level": pyramid_level,
             })
 
+        # RANGE is drain/migration-only, but legacy live lots still need correct ownership.
         for symbol, rst in state_range.items():
             basket = (rst or {}).get("basket") or {}
             legs = basket.get("legs") or []
@@ -6016,25 +6215,62 @@ class Bot:
                     weighted_entry[side] = weighted_entry.get(side, D(0)) + q * ep
             for side, q in grouped.items():
                 ventry = weighted_entry.get(side, D(0)) / q if q > 0 else D(0)
+                recovery = max(0, int(basket.get("alternations", 0) or 0))
                 add_logical(
                     symbol, side, str((rst or {}).get("strategy") or f"RANGE:{symbol}"), q,
                     basket.get("recovery_tp_price") or basket.get("tp_price") or "-",
                     basket.get("hard_stop_price") or "-",
-                    basket.get("alternations", 0),
+                    recovery,
                     ventry,
+                    RECOVERY_MULTIPLIER ** recovery,
+                    "-",
                 )
 
-
+        # PYRAMID progress is a ladder level, not a recovery/martingale level.
         for pst in state_pyramid.values():
             pst = pst or {}
-            symbol = str(pst.get("symbol", "")).upper(); side = str(pst.get("side", "")).upper()
+            symbol = str(pst.get("symbol", "")).upper()
+            side = str(pst.get("side", "")).upper()
             legs = pst.get("legs", []) or []
             q = sum((dec(x.get("qty")) for x in legs), D(0))
             weighted = sum((dec(x.get("qty")) * dec(x.get("entry_price")) for x in legs), D(0))
             ventry = weighted / q if q > 0 else D(0)
             if q > 0:
-                add_logical(symbol, side, str(pst.get("strategy")), q, "-", f"MAX_LOSS_USD={PYRAMID_MAX_LOSS_USD}",
-                            int(pst.get("next_level", 1)) - 1, ventry)
+                ladder_level = max(0, int(pst.get("next_level", 1) or 1) - 1)
+                add_logical(
+                    symbol, side, str(pst.get("strategy") or f"PYRAMID:{symbol}:{side}"), q,
+                    "-", f"MAX_LOSS_USD={PYRAMID_MAX_LOSS_USD}",
+                    0, ventry, D(1), ladder_level,
+                )
+
+        # MICRO SCALPER owns one live leg per symbol at most. It must participate in the
+        # same ownership report, otherwise a valid scalper position can look EXTERNAL.
+        for sst in state_scalper.values():
+            sst = sst or {}
+            pos = sst.get("position") or {}
+            leg = pos.get("leg") if isinstance(pos, dict) else None
+            if not isinstance(leg, dict):
+                continue
+            symbol = str(sst.get("symbol") or "").upper()
+            side = str(pos.get("side") or leg.get("side") or "").upper()
+            q = dec(leg.get("qty"))
+            if q <= 0:
+                continue
+            ventry = dec(pos.get("entry_price") or leg.get("entry_price"))
+            recovery = max(0, int(pos.get("recovery_level", sst.get("recovery_level", 0)) or 0))
+            size_multiplier = dec(
+                pos.get("size_multiplier") or sst.get("last_size_multiplier") or "1",
+                "1",
+            )
+            add_logical(
+                symbol, side, str(sst.get("strategy") or f"SCALPER:{symbol}"), q,
+                pos.get("tp_price") or "-",
+                pos.get("stop_price") or "-",
+                recovery,
+                ventry,
+                size_multiplier,
+                "-",
+            )
 
         for p in (positions if isinstance(positions, list) else []):
             qty = abs(dec(p.get("positionAmt")))
@@ -6076,30 +6312,49 @@ class Bot:
             liq = p.get("liquidationPrice") or "?"
             move = pct_change(entry, mark) if entry > 0 and mark > 0 else D(0)
             favorable = move if side == "LONG" else -move
-            target = stop = recovery_level = "-"
+            target = stop = recovery_level = pyramid_level = size_multiplier = "-"
 
             unique_strategies = list(dict.fromkeys(str(x["strategy"]) for x in candidates))
             if len(unique_strategies) == 1 and candidates:
-                target = candidates[0].get("target") or "-"
-                stop = candidates[0].get("stop") or "-"
-                recovery_level = candidates[0].get("recovery", "-")
+                first = candidates[0]
+                target = first.get("target") or "-"
+                stop = first.get("stop") or "-"
+                strategy_name = unique_strategies[0]
+                if strategy_name.startswith("PYRAMID:"):
+                    recovery_level = 0
+                    pyramid_level = first.get("pyramid_level", "-")
+                    size_multiplier = "1"
+                else:
+                    recovery_level = first.get("recovery", "-")
+                    pyramid_level = "-"
+                    size_multiplier = first.get("size_multiplier", "-")
 
             virtual_lot_parts = []
             for x in candidates:
                 x_qty = dec(x.get("qty"))
-                x_recovery_raw = x.get("recovery", 0)
                 try:
-                    x_recovery = max(0, int(x_recovery_raw))
+                    x_recovery = max(0, int(x.get("recovery", 0) or 0))
                 except Exception:
                     x_recovery = 0
                 is_pyramid = str(x.get("strategy", "")).startswith("PYRAMID:")
                 is_scalper = str(x.get("strategy", "")).startswith("SCALPER:")
-                x_multiplier = D(1) if (is_pyramid or is_scalper) else RECOVERY_MULTIPLIER ** x_recovery
-                x_base_notional = PYRAMID_INITIAL_NOTIONAL_USD if is_pyramid else (configured_scalper_initial_notional(symbol) if is_scalper else configured_initial_notional(symbol))
-                x_notional = x_qty * mark if mark > 0 else D(0)
-                x_mode = "PYRAMID" if is_pyramid else ("SCALPER" if is_scalper else ("NORMAL" if x_recovery == 0 else "RECOVERY"))
-                if is_pyramid or is_scalper:
+                x_pyramid_level = x.get("pyramid_level", "-") if is_pyramid else "-"
+                if is_pyramid:
                     x_recovery = 0
+                    x_multiplier = D(1)
+                    x_mode = "PYRAMID"
+                elif is_scalper:
+                    x_multiplier = dec(x.get("size_multiplier"), "1")
+                    x_mode = "SCALPER_RECOVERY" if x_recovery > 0 else "SCALPER"
+                else:
+                    x_multiplier = RECOVERY_MULTIPLIER ** x_recovery
+                    x_mode = "NORMAL" if x_recovery == 0 else "RECOVERY"
+                x_base_notional = (
+                    PYRAMID_INITIAL_NOTIONAL_USD if is_pyramid
+                    else configured_scalper_initial_notional(symbol) if is_scalper
+                    else configured_initial_notional(symbol)
+                )
+                x_notional = x_qty * mark if mark > 0 else D(0)
                 virtual_lot_parts.append(
                     f"{x['strategy']}:{side}"
                     f"|qty={dstr(x_qty, 8)}"
@@ -6107,6 +6362,7 @@ class Bot:
                     f"|notional_usd={dstr(x_notional, 8)}"
                     f"|mode={x_mode}"
                     f"|recovery_level={x_recovery}"
+                    f"|pyramid_level={x_pyramid_level}"
                     f"|multiplier={dstr(x_multiplier, 4)}x"
                     f"|base_notional_usd={dstr(x_base_notional, 8)}"
                     f"|tp={x.get('target','-')}"
@@ -6138,26 +6394,39 @@ class Bot:
                 f"OPEN POSITION | strategy={owner} | symbol={symbol} side={side} qty={qty} virtual_qty={virtual_qty} residual={dstr(residual, 8)} | "
                 f"entry={entry} mark={mark} move_favoravel={dstr(favorable * D(100), 6)}% | notional_usd={notional} margin_isolada={margin} leverage={leverage}x unreal_pnl={unreal} | "
                 f"tp={target} distancia_tp={tp_distance}% | stop={stop} distancia_stop={stop_distance}% | "
-                f"liq={liq} distancia_liq={liq_distance}% buffer_stop_liq={stop_liq_buffer}% | recovery_level={recovery_level} | virtual_lots={virtual_lots}"
+                f"liq={liq} distancia_liq={liq_distance}% buffer_stop_liq={stop_liq_buffer}% | "
+                f"recovery_level={recovery_level} pyramid_level={pyramid_level} size_multiplier={size_multiplier}x | virtual_lots={virtual_lots}"
             )
 
             for x in candidates:
                 x_qty = dec(x.get("qty"))
                 try:
-                    x_recovery = max(0, int(x.get("recovery", 0)))
+                    x_recovery = max(0, int(x.get("recovery", 0) or 0))
                 except Exception:
                     x_recovery = 0
                 is_pyramid = str(x.get("strategy", "")).startswith("PYRAMID:")
                 is_scalper = str(x.get("strategy", "")).startswith("SCALPER:")
-                x_multiplier = D(1) if (is_pyramid or is_scalper) else RECOVERY_MULTIPLIER ** x_recovery
-                x_base_notional = PYRAMID_INITIAL_NOTIONAL_USD if is_pyramid else (configured_scalper_initial_notional(symbol) if is_scalper else configured_initial_notional(symbol))
-                x_notional = x_qty * mark if mark > 0 else D(0)
-                x_mode = "PYRAMID" if is_pyramid else ("SCALPER" if is_scalper else ("NORMAL" if x_recovery == 0 else "RECOVERY"))
-                if is_pyramid or is_scalper:
+                x_pyramid_level = x.get("pyramid_level", "-") if is_pyramid else "-"
+                if is_pyramid:
                     x_recovery = 0
+                    x_multiplier = D(1)
+                    x_mode = "PYRAMID"
+                elif is_scalper:
+                    x_multiplier = dec(x.get("size_multiplier"), "1")
+                    x_mode = "SCALPER_RECOVERY" if x_recovery > 0 else "SCALPER"
+                else:
+                    x_multiplier = RECOVERY_MULTIPLIER ** x_recovery
+                    x_mode = "NORMAL" if x_recovery == 0 else "RECOVERY"
+                x_base_notional = (
+                    PYRAMID_INITIAL_NOTIONAL_USD if is_pyramid
+                    else configured_scalper_initial_notional(symbol) if is_scalper
+                    else configured_initial_notional(symbol)
+                )
+                x_notional = x_qty * mark if mark > 0 else D(0)
                 logger.warning(
                     f"VIRTUAL STRATEGY | strategy={x.get('strategy')} | symbol={symbol} side={side} | qty={dstr(x_qty, 8)} | notional_usd={dstr(x_notional, 8)} | "
-                    f"mode={x_mode} | recovery_level={x_recovery} | multiplier={dstr(x_multiplier, 4)}x | base_notional_usd={dstr(x_base_notional, 8)} | tp={x.get('target', '-')} | sl={x.get('stop', '-')}"
+                    f"mode={x_mode} | recovery_level={x_recovery} | pyramid_level={x_pyramid_level} | multiplier={dstr(x_multiplier, 4)}x | "
+                    f"base_notional_usd={dstr(x_base_notional, 8)} | tp={x.get('target', '-')} | sl={x.get('stop', '-')}"
                 )
         if found == 0:
             logger.info("OPEN POSITION | nenhuma posicao real aberta")
