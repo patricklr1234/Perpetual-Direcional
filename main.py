@@ -6,7 +6,8 @@ PERPETUAL DIRECIONAL — BTC / ETH / HYPE
 
 Identidade do robô:
   - Nome operacional: ASTER_PERPETUAL_DIRECIONAL
-  - Estratégia ativa: PYRAMID 1% independente por símbolo e lado.
+  - Estratégias ativas: PYRAMID 1% + MICRO SCALPER independente por símbolo.
+  - MICRO SCALPER usa book/tape/microprice, entrada LIMIT GTX (Post Only), saída normal rápida e STOP_MARKET nativo.
   - RANGE está permanentemente aposentado neste robô.
 
 PYRAMID:
@@ -35,6 +36,7 @@ Execução e consistência:
     reconciliado por clientOrderId, sem reenvio cego.
   - RANGE legado existe apenas como compatibilidade de migração/retirada e nunca
     volta a abrir novas posições.
+  - SCALPER possui bankroll/state/ownership próprios e usa recovery progressivo limitado; não usa martingale exponencial.
 
 Persistência:
   - BOT_DIR/state.json
@@ -68,6 +70,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
@@ -97,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.24.0-v56-clean-architecture-migration"
+VERSION = "8.27.1-v59.1-scalper-recovery-compound-liquidity"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -184,6 +187,67 @@ PYRAMID_NATIVE_STOP_REFRESH_SECONDS = float(os.getenv("PYRAMID_NATIVE_STOP_REFRE
 PYRAMID_MAX_LEVELS_PER_TICK = int(os.getenv("PYRAMID_MAX_LEVELS_PER_TICK", "20"))
 PYRAMID_APPLY_NEWS_FILTER = os.getenv("PYRAMID_APPLY_NEWS_FILTER", "1") == "1"
 PYRAMID_STOP_AFTER_MAX_LOSS = os.getenv("PYRAMID_STOP_AFTER_MAX_LOSS", "1") == "1"
+TAKER_FEE_RATE = D(os.getenv("TAKER_FEE_RATE", "0.0004"))
+
+# MICRO SCALPER / MICRO-MAKER: um bankroll independente por ativo, LONG ou SHORT por vez.
+# Entrada é exclusivamente LIMIT GTX (Post Only); saída normal usa MARKET por segurança
+# com posição agregada em Hedge Mode. O STOP_MARKET nativo permanece sempre a primeira
+# camada de proteção. Não existe martingale/recovery nesta estratégia.
+SCALPER_ENGINE_ENABLED = os.getenv("SCALPER_ENGINE_ENABLED", "1") == "1"
+SCALPER_BANKROLL_USD = D(os.getenv("SCALPER_BANKROLL_USD", "10"))
+BTC_SCALPER_BANKROLL_USD = D(os.getenv("BTC_SCALPER_BANKROLL_USD", str(SCALPER_BANKROLL_USD)))
+SCALPER_INITIAL_NOTIONAL_USD = D(os.getenv("SCALPER_INITIAL_NOTIONAL_USD", "10"))
+BTC_SCALPER_INITIAL_NOTIONAL_USD = D(os.getenv("BTC_SCALPER_INITIAL_NOTIONAL_USD", "100"))
+SCALPER_LEVERAGE = int(os.getenv("SCALPER_LEVERAGE", str(PYRAMID_LEVERAGE)))
+SCALPER_MAKER_FEE_RATE = D(os.getenv("SCALPER_MAKER_FEE_RATE", "0"))
+SCALPER_TAKER_FEE_RATE = D(os.getenv("SCALPER_TAKER_FEE_RATE", str(TAKER_FEE_RATE)))
+SCALPER_MAX_SPREAD_PCT = D(os.getenv("SCALPER_MAX_SPREAD_PCT", "0.0008"))
+SCALPER_MIN_RANGE_PCT = D(os.getenv("SCALPER_MIN_RANGE_PCT", "0.0008"))
+SCALPER_MAX_RANGE_PCT = D(os.getenv("SCALPER_MAX_RANGE_PCT", "0.008"))
+SCALPER_SCORE_THRESHOLD = D(os.getenv("SCALPER_SCORE_THRESHOLD", "0.16"))
+SCALPER_MIN_DEPTH_IMBALANCE = D(os.getenv("SCALPER_MIN_DEPTH_IMBALANCE", "0.08"))
+SCALPER_MIN_TAPE_IMBALANCE = D(os.getenv("SCALPER_MIN_TAPE_IMBALANCE", "0.05"))
+SCALPER_MOMENTUM_NORM_PCT = D(os.getenv("SCALPER_MOMENTUM_NORM_PCT", "0.0005"))
+SCALPER_MIN_TARGET_PCT = D(os.getenv("SCALPER_MIN_TARGET_PCT", "0.0012"))
+SCALPER_MAX_TARGET_PCT = D(os.getenv("SCALPER_MAX_TARGET_PCT", "0.0035"))
+SCALPER_MIN_NET_EDGE_PCT = D(os.getenv("SCALPER_MIN_NET_EDGE_PCT", "0.0005"))
+SCALPER_MIN_STOP_PCT = D(os.getenv("SCALPER_MIN_STOP_PCT", "0.0025"))
+SCALPER_MAX_STOP_PCT = D(os.getenv("SCALPER_MAX_STOP_PCT", "0.006"))
+SCALPER_MAX_HOLD_SECONDS = float(os.getenv("SCALPER_MAX_HOLD_SECONDS", "120"))
+SCALPER_SIGNAL_CONFIRM_SECONDS = float(os.getenv("SCALPER_SIGNAL_CONFIRM_SECONDS", "0.75"))
+SCALPER_ENTRY_COOLDOWN_SECONDS = float(os.getenv("SCALPER_ENTRY_COOLDOWN_SECONDS", "3"))
+SCALPER_POST_ONLY_WAIT_SECONDS = float(os.getenv("SCALPER_POST_ONLY_WAIT_SECONDS", "1.5"))
+SCALPER_MAX_LOSS_USD = D(os.getenv("SCALPER_MAX_LOSS_USD", "2"))
+SCALPER_MAX_RISK_FRACTION = D(os.getenv("SCALPER_MAX_RISK_FRACTION", "0.10"))
+SCALPER_APPLY_NEWS_FILTER = os.getenv("SCALPER_APPLY_NEWS_FILTER", "1") == "1"
+
+# Recovery progressivo do MICRO SCALPER. Nao e martingale: a exposicao cresce em
+# degraus pequenos, sempre limitada pelo risco do bankroll, pela margem e pela liquidez.
+SCALPER_RECOVERY_MULTIPLIERS = tuple(
+    D(x.strip()) for x in os.getenv("SCALPER_RECOVERY_MULTIPLIERS", "1,1.25,1.50,1.75,2.00").split(",") if x.strip()
+)
+SCALPER_RECOVERY_MAX_LEVEL = max(0, len(SCALPER_RECOVERY_MULTIPLIERS) - 1)
+SCALPER_RECOVERY_SCORE_STEP = D(os.getenv("SCALPER_RECOVERY_SCORE_STEP", "0.03"))
+SCALPER_RECOVERY_DEPTH_STEP = D(os.getenv("SCALPER_RECOVERY_DEPTH_STEP", "0.02"))
+SCALPER_RECOVERY_TAPE_STEP = D(os.getenv("SCALPER_RECOVERY_TAPE_STEP", "0.015"))
+SCALPER_RECOVERY_CONFIRM_STEP_SECONDS = float(os.getenv("SCALPER_RECOVERY_CONFIRM_STEP_SECONDS", "0.25"))
+SCALPER_RECOVERY_COOLDOWN_STEP_SECONDS = float(os.getenv("SCALPER_RECOVERY_COOLDOWN_STEP_SECONDS", "2.0"))
+SCALPER_LOSS_PAUSE_AFTER_STREAK = int(os.getenv("SCALPER_LOSS_PAUSE_AFTER_STREAK", "3"))
+SCALPER_LOSS_PAUSE_SECONDS = float(os.getenv("SCALPER_LOSS_PAUSE_SECONDS", "30"))
+
+# Compounding controlado: somente parte do lucro realizado aumenta o notional-base,
+# e o crescimento fica limitado. Durante recovery o compounding fica suspenso.
+SCALPER_COMPOUND_ENABLED = os.getenv("SCALPER_COMPOUND_ENABLED", "1") == "1"
+SCALPER_COMPOUND_PROFIT_SHARE = D(os.getenv("SCALPER_COMPOUND_PROFIT_SHARE", "0.50"))
+SCALPER_COMPOUND_MAX_MULTIPLIER = D(os.getenv("SCALPER_COMPOUND_MAX_MULTIPLIER", "2.00"))
+
+# Liquidity-aware execution. Entrada maker e saida normal so sao dimensionadas quando
+# o top-20 do book consegue absorver a posicao com participacao/impacto limitados.
+SCALPER_MAX_BOOK_PARTICIPATION = D(os.getenv("SCALPER_MAX_BOOK_PARTICIPATION", "0.05"))
+SCALPER_MAX_EXIT_SLIPPAGE_PCT = D(os.getenv("SCALPER_MAX_EXIT_SLIPPAGE_PCT", "0.0010"))
+SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION = D(os.getenv("SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION", "0.10"))
+SCALPER_EXIT_CHUNK_SLEEP_SECONDS = float(os.getenv("SCALPER_EXIT_CHUNK_SLEEP_SECONDS", "0.15"))
+SCALPER_MAX_EXIT_CHUNKS = int(os.getenv("SCALPER_MAX_EXIT_CHUNKS", "12"))
 NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP = os.getenv("NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP", "1") == "1"
 RETIRE_PRE_V56_PYRAMID_ON_STARTUP = os.getenv("RETIRE_PRE_V56_PYRAMID_ON_STARTUP", "1") == "1"
 PRE_V56_PYRAMID_MIGRATION_ID = "PYRAMID_PRE_V56_ARCHITECTURE_RETIRE"
@@ -231,6 +295,13 @@ LEDGER_RECONCILE_ON_STARTUP = os.getenv("LEDGER_RECONCILE_ON_STARTUP", "1") == "
 SELF_TEST_ON_STARTUP = os.getenv("SELF_TEST_ON_STARTUP", "1") == "1"
 AUTO_REPAIR_ZERO_PHYSICAL_LEDGER = os.getenv("AUTO_REPAIR_ZERO_PHYSICAL_LEDGER", "1") == "1"
 
+
+def configured_scalper_bankroll(symbol: str) -> Decimal:
+    return BTC_SCALPER_BANKROLL_USD if str(symbol).upper() == "BTCUSDT" else SCALPER_BANKROLL_USD
+
+def configured_scalper_initial_notional(symbol: str) -> Decimal:
+    return BTC_SCALPER_INITIAL_NOTIONAL_USD if str(symbol).upper() == "BTCUSDT" else SCALPER_INITIAL_NOTIONAL_USD
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 def validate_runtime_config() -> None:
@@ -267,6 +338,32 @@ def validate_runtime_config() -> None:
     require(MAX_TOTAL_SYMBOL_NOTIONAL_USD >= PYRAMID_INITIAL_NOTIONAL_USD, "MAX_TOTAL_SYMBOL_NOTIONAL_USD menor que PYRAMID_INITIAL_NOTIONAL_USD")
     require(BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD >= PYRAMID_INITIAL_NOTIONAL_USD, "BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD menor que PYRAMID_INITIAL_NOTIONAL_USD")
     require(PROTECTIVE_WORKING_TYPE in ("MARK_PRICE", "CONTRACT_PRICE"), f"PROTECTIVE_WORKING_TYPE invalido: {PROTECTIVE_WORKING_TYPE}")
+    require(D(0) <= TAKER_FEE_RATE < D("0.01"), f"TAKER_FEE_RATE invalida: {TAKER_FEE_RATE}")
+    require(SCALPER_BANKROLL_USD > 0 and BTC_SCALPER_BANKROLL_USD > 0, "SCALPER bankrolls devem ser >0")
+    require(SCALPER_INITIAL_NOTIONAL_USD > 0 and BTC_SCALPER_INITIAL_NOTIONAL_USD > 0, "SCALPER notionals devem ser >0")
+    require(1 <= SCALPER_LEVERAGE <= PYRAMID_MAX_EFFECTIVE_LEVERAGE, f"SCALPER_LEVERAGE deve respeitar cap compartilhado {PYRAMID_MAX_EFFECTIVE_LEVERAGE}x")
+    require(D(0) <= SCALPER_MAKER_FEE_RATE < D("0.01") and D(0) <= SCALPER_TAKER_FEE_RATE < D("0.01"), "SCALPER fees invalidas")
+    require(D(0) < SCALPER_MAX_SPREAD_PCT < D("0.02"), "SCALPER_MAX_SPREAD_PCT invalido")
+    require(D(0) < SCALPER_MIN_RANGE_PCT < SCALPER_MAX_RANGE_PCT < D("0.10"), "SCALPER range gates invalidos")
+    require(D(0) < SCALPER_SCORE_THRESHOLD <= D(1), "SCALPER_SCORE_THRESHOLD invalido")
+    require(D(0) <= SCALPER_MIN_DEPTH_IMBALANCE < D(1) and D(0) <= SCALPER_MIN_TAPE_IMBALANCE < D(1), "SCALPER imbalance gates invalidos")
+    require(D(0) < SCALPER_MIN_TARGET_PCT <= SCALPER_MAX_TARGET_PCT < D("0.05"), "SCALPER target invalido")
+    require(D(0) < SCALPER_MIN_STOP_PCT <= SCALPER_MAX_STOP_PCT < D("0.10"), "SCALPER stop invalido")
+    require(SCALPER_MAX_HOLD_SECONDS > 0 and SCALPER_SIGNAL_CONFIRM_SECONDS >= 0 and SCALPER_ENTRY_COOLDOWN_SECONDS >= 0 and SCALPER_POST_ONLY_WAIT_SECONDS > 0, "SCALPER timing invalido")
+    require(SCALPER_MAX_LOSS_USD > 0 and D(0) < SCALPER_MAX_RISK_FRACTION <= D(1), "SCALPER risk limits invalidos")
+    require(len(SCALPER_RECOVERY_MULTIPLIERS) >= 1 and SCALPER_RECOVERY_MULTIPLIERS[0] == D(1), "SCALPER recovery deve iniciar em 1x")
+    require(all(x >= D(1) for x in SCALPER_RECOVERY_MULTIPLIERS), "SCALPER recovery multipliers devem ser >=1")
+    require(all(SCALPER_RECOVERY_MULTIPLIERS[i] <= SCALPER_RECOVERY_MULTIPLIERS[i+1] for i in range(len(SCALPER_RECOVERY_MULTIPLIERS)-1)), "SCALPER recovery multipliers devem ser nao-decrescentes")
+    require(SCALPER_RECOVERY_MULTIPLIERS[-1] <= D(3), "SCALPER recovery max acima de 3x nao permitido nesta arquitetura")
+    require(D(0) <= SCALPER_RECOVERY_SCORE_STEP < D(1) and D(0) <= SCALPER_RECOVERY_DEPTH_STEP < D(1) and D(0) <= SCALPER_RECOVERY_TAPE_STEP < D(1), "SCALPER recovery signal steps invalidos")
+    require(SCALPER_RECOVERY_CONFIRM_STEP_SECONDS >= 0 and SCALPER_RECOVERY_COOLDOWN_STEP_SECONDS >= 0, "SCALPER recovery timing invalido")
+    require(SCALPER_LOSS_PAUSE_AFTER_STREAK >= 1 and SCALPER_LOSS_PAUSE_SECONDS >= 0, "SCALPER loss pause invalido")
+    require(D(0) <= SCALPER_COMPOUND_PROFIT_SHARE <= D(1), "SCALPER compound share deve estar em [0,1]")
+    require(D(1) <= SCALPER_COMPOUND_MAX_MULTIPLIER <= D(5), "SCALPER compound max invalido")
+    require(D(0) < SCALPER_MAX_BOOK_PARTICIPATION <= D("0.25"), "SCALPER book participation invalida")
+    require(D(0) < SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION <= D("0.50"), "SCALPER exit chunk participation invalida")
+    require(D(0) < SCALPER_MAX_EXIT_SLIPPAGE_PCT < D("0.02"), "SCALPER max exit slippage invalida")
+    require(SCALPER_EXIT_CHUNK_SLEEP_SECONDS >= 0 and SCALPER_MAX_EXIT_CHUNKS >= 1, "SCALPER exit chunk config invalida")
 
     for name, value in (("HTTP_TIMEOUT", HTTP_TIMEOUT), ("ORDER_FILL_WAIT_SECONDS", ORDER_FILL_WAIT_SECONDS), ("ORDER_POLL_SECONDS", ORDER_POLL_SECONDS),
                         ("MAIN_LOOP_SECONDS", MAIN_LOOP_SECONDS), ("REST_PRICE_FALLBACK_SECONDS", REST_PRICE_FALLBACK_SECONDS), ("HEARTBEAT_SECONDS", HEARTBEAT_SECONDS),
@@ -612,7 +709,8 @@ class AsterClient:
         return self._request("GET", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
 
     def order(self, symbol: str, side: str, position_side: str, quantity: Decimal,
-              client_id: str, order_type: str = "MARKET") -> Dict[str, Any]:
+              client_id: str, order_type: str = "MARKET", price: Optional[Decimal] = None,
+              time_in_force: Optional[str] = None) -> Dict[str, Any]:
         p = {
             "symbol": symbol,
             "side": side,
@@ -622,6 +720,11 @@ class AsterClient:
             "newClientOrderId": client_id[:36],
             "newOrderRespType": "RESULT",
         }
+        if order_type == "LIMIT":
+            if price is None or dec(price) <= 0:
+                raise ValueError("LIMIT requer price > 0")
+            p["price"] = dstr(dec(price), 12)
+            p["timeInForce"] = str(time_in_force or "GTC").upper()
         try:
             return self._request("POST", "/fapi/v3/order", p, signed=True)
         except AsterAPIError as e:
@@ -788,11 +891,23 @@ class RulesBook:
 # -----------------------------------------------------------------------------
 
 class MarketData:
+    """Market data for both slower PYRAMID logic and the micro-scalper.
+
+    Streams:
+      - miniTicker: robust last price
+      - bookTicker: best bid/ask and size, real time
+      - aggTrade: taker-flow / tape imbalance, 100ms aggregation
+      - depth20@100ms: top-five imbalance + top-20 liquidity/impact
+    """
     def __init__(self, client: AsterClient):
         self.client = client
         self.prices: Dict[str, Decimal] = {}
         self.price_ts: Dict[str, float] = {}
-        self._lock = threading.Lock()
+        self.book: Dict[str, Dict[str, Any]] = {}
+        self.depth20: Dict[str, Dict[str, Any]] = {}
+        self.trades: Dict[str, deque] = {s: deque(maxlen=3000) for s in SYMBOLS}
+        self.samples: Dict[str, deque] = {s: deque(maxlen=3000) for s in SYMBOLS}
+        self._lock = threading.RLock()
         self.stop = threading.Event()
         self.ws_thread: Optional[threading.Thread] = None
         self.rest_thread: Optional[threading.Thread] = None
@@ -802,7 +917,7 @@ class MarketData:
             self.ws_thread = threading.Thread(target=self._ws_loop, name="market-ws", daemon=True)
             self.ws_thread.start()
         else:
-            logger.warning("websocket-client ausente; usando REST fallback")
+            logger.warning("websocket-client ausente; usando REST fallback; SCALPER nao entra sem microestrutura WS")
         self.rest_thread = threading.Thread(target=self._rest_loop, name="market-rest", daemon=True)
         self.rest_thread.start()
 
@@ -829,16 +944,111 @@ class MarketData:
             logger.warning(f"PRICE FALLBACK FAIL | {symbol} | age_s={age:.3f} | {e}")
             return None if age > max_age else p
 
-    def _set(self, symbol: str, price: Decimal) -> None:
+    def _sample_price(self, symbol: str, price: Decimal, ts: Optional[float] = None) -> None:
         if price <= 0:
             return
+        t = ts or time.time()
+        with self._lock:
+            q = self.samples.setdefault(symbol, deque(maxlen=3000))
+            if not q or t - q[-1][0] >= 0.02:
+                q.append((t, price))
+            cutoff = t - 15.0
+            while q and q[0][0] < cutoff:
+                q.popleft()
+
+    def _set(self, symbol: str, price: Decimal, ts: Optional[float] = None) -> None:
+        if price <= 0:
+            return
+        t = ts or time.time()
         with self._lock:
             self.prices[symbol] = price
-            self.price_ts[symbol] = time.time()
+            self.price_ts[symbol] = t
+        self._sample_price(symbol, price, t)
+
+    def micro_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
+        now_t = time.time()
+        with self._lock:
+            b = dict(self.book.get(symbol) or {})
+            d = dict(self.depth20.get(symbol) or {})
+            trades = list(self.trades.get(symbol) or [])
+            samples = list(self.samples.get(symbol) or [])
+        bid = dec(b.get("bid")); ask = dec(b.get("ask")); bidq = dec(b.get("bid_qty")); askq = dec(b.get("ask_qty"))
+        book_ts = float(b.get("ts") or 0)
+        depth_ts = float(d.get("ts") or 0)
+        if bid <= 0 or ask <= bid or bidq < 0 or askq < 0 or now_t - book_ts > 2.0 or now_t - depth_ts > 2.0:
+            return None
+        mid = (bid + ask) / D(2)
+        spread_pct = (ask - bid) / mid if mid > 0 else D(1)
+        bbo_den = bidq + askq
+        bbo_imb = (bidq - askq) / bbo_den if bbo_den > 0 else D(0)
+        micro = (ask * bidq + bid * askq) / bbo_den if bbo_den > 0 else mid
+        micro_bias = (micro - mid) / mid if mid > 0 else D(0)
+
+        bids = d.get("bids") or []
+        asks = d.get("asks") or []
+        bid_levels = [(dec(px), dec(q)) for px, q in bids if dec(px) > 0 and dec(q) > 0]
+        ask_levels = [(dec(px), dec(q)) for px, q in asks if dec(px) > 0 and dec(q) > 0]
+        # Signal remains top-5 so its behavior is not diluted by far-away liquidity.
+        bid_depth5 = sum((px * q for px, q in bid_levels[:5]), D(0))
+        ask_depth5 = sum((px * q for px, q in ask_levels[:5]), D(0))
+        depth_den = bid_depth5 + ask_depth5
+        depth_imb = (bid_depth5 - ask_depth5) / depth_den if depth_den > 0 else D(0)
+        # Execution capacity/impact uses the full top-20 book.
+        bid_depth = sum((px * q for px, q in bid_levels), D(0))
+        ask_depth = sum((px * q for px, q in ask_levels), D(0))
+
+        tape_cutoff = now_t - 2.0
+        buy_flow = D(0); sell_flow = D(0)
+        for ts, px, qty, buyer_maker in trades:
+            if ts < tape_cutoff:
+                continue
+            notion = px * qty
+            if buyer_maker:
+                sell_flow += notion  # buyer is maker => aggressive seller
+            else:
+                buy_flow += notion   # buyer is taker => aggressive buyer
+        tape_den = buy_flow + sell_flow
+        tape_imb = (buy_flow - sell_flow) / tape_den if tape_den > 0 else D(0)
+
+        def sample_at_or_before(seconds_ago: float) -> Decimal:
+            target = now_t - seconds_ago
+            candidate = D(0)
+            for ts, px in samples:
+                if ts <= target:
+                    candidate = px
+                else:
+                    break
+            return candidate or (samples[0][1] if samples else mid)
+
+        last = samples[-1][1] if samples else mid
+        p1 = sample_at_or_before(1.0)
+        p3 = sample_at_or_before(3.0)
+        mom1 = (last / p1 - D(1)) if p1 > 0 else D(0)
+        mom3 = (last / p3 - D(1)) if p3 > 0 else D(0)
+        recent5 = [px for ts, px in samples if ts >= now_t - 5.0]
+        range5 = ((max(recent5) - min(recent5)) / mid) if len(recent5) >= 2 and mid > 0 else D(0)
+
+        norm = max(SCALPER_MOMENTUM_NORM_PCT, D("0.00000001"))
+        mom_component = max(D(-1), min(D(1), mom1 / norm))
+        micro_scale = max(spread_pct / D(2), D("0.00000001"))
+        micro_component = max(D(-1), min(D(1), micro_bias / micro_scale))
+        score = D("0.35") * depth_imb + D("0.20") * bbo_imb + D("0.25") * tape_imb + D("0.10") * micro_component + D("0.10") * mom_component
+        return {
+            "bid": bid, "ask": ask, "bid_qty": bidq, "ask_qty": askq, "mid": mid,
+            "spread_pct": spread_pct, "bbo_imbalance": bbo_imb, "depth_imbalance": depth_imb,
+            "tape_imbalance": tape_imb, "microprice": micro, "micro_bias": micro_bias,
+            "momentum_1s": mom1, "momentum_3s": mom3, "range_5s": range5, "score": score,
+            "buy_flow": buy_flow, "sell_flow": sell_flow, "age_book": now_t-book_ts, "age_depth": now_t-depth_ts,
+            "bid_depth_usd": bid_depth, "ask_depth_usd": ask_depth,
+            "bid_levels": bid_levels, "ask_levels": ask_levels,
+        }
 
     def _ws_loop(self) -> None:
-        streams = "/".join(f"{s.lower()}@miniTicker" for s in SYMBOLS)
-        url = f"{WS_BASE}/stream?streams={streams}"
+        streams = []
+        for s in SYMBOLS:
+            sl = s.lower()
+            streams.extend((f"{sl}@miniTicker", f"{sl}@bookTicker", f"{sl}@aggTrade", f"{sl}@depth20@100ms"))
+        url = f"{WS_BASE}/stream?streams={'/'.join(streams)}"
         while not self.stop.is_set():
             try:
                 def on_message(ws, message):
@@ -846,43 +1056,54 @@ class MarketData:
                         j = json.loads(message)
                         data = j.get("data", j)
                         sym = str(data.get("s", "")).upper()
-                        p = dec(data.get("c"))
-                        if sym in SYMBOLS and p > 0:
-                            self._set(sym, p)
+                        if sym not in SYMBOLS:
+                            return
+                        et = str(data.get("e", ""))
+                        t = time.time()
+                        if et == "bookTicker" or ("b" in data and "a" in data and "B" in data and "A" in data):
+                            bid = dec(data.get("b")); ask = dec(data.get("a"))
+                            if bid > 0 and ask > bid:
+                                with self._lock:
+                                    self.book[sym] = {"bid": bid, "ask": ask, "bid_qty": dec(data.get("B")), "ask_qty": dec(data.get("A")), "ts": t}
+                                self._sample_price(sym, (bid + ask) / D(2), t)
+                        elif et == "aggTrade":
+                            px = dec(data.get("p")); qty = dec(data.get("q")); buyer_maker = bool(data.get("m"))
+                            if px > 0 and qty > 0:
+                                with self._lock:
+                                    q = self.trades.setdefault(sym, deque(maxlen=3000)); q.append((t, px, qty, buyer_maker))
+                                    cutoff = t - 10.0
+                                    while q and q[0][0] < cutoff: q.popleft()
+                                self._sample_price(sym, px, t)
+                        elif et == "depthUpdate" or ("b" in data and "a" in data and isinstance(data.get("b"), list)):
+                            bids = data.get("b") or [] ; asks = data.get("a") or []
+                            with self._lock:
+                                self.depth20[sym] = {"bids": bids[:20], "asks": asks[:20], "ts": t}
+                        else:
+                            p = dec(data.get("c"))
+                            if p > 0:
+                                self._set(sym, p, t)
                     except Exception:
                         pass
 
-                def on_open(ws):
-                    logger.info(f"MARKET WS | CONECTADO | {url}")
-
-                def on_error(ws, error):
-                    logger.warning(f"MARKET WS | erro={error}")
-
-                def on_close(ws, code, msg):
-                    logger.warning(f"MARKET WS | fechado code={code} msg={msg}")
-
-                app = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message,
-                                             on_error=on_error, on_close=on_close)
+                def on_open(ws): logger.info(f"MARKET WS | CONECTADO | microstructure=miniTicker+bookTicker+aggTrade+depth20 | {url}")
+                def on_error(ws, error): logger.warning(f"MARKET WS | erro={error}")
+                def on_close(ws, code, msg): logger.warning(f"MARKET WS | fechado code={code} msg={msg}")
+                app = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
                 app.run_forever(ping_interval=120, ping_timeout=30)
             except Exception as e:
                 logger.warning(f"MARKET WS LOOP | {e}")
-            if self.stop.is_set():
-                break
+            if self.stop.is_set(): break
             self.stop.wait(3)
 
     def _rest_loop(self) -> None:
         while not self.stop.wait(REST_PRICE_FALLBACK_SECONDS):
-            if self.stop.is_set():
-                break
+            if self.stop.is_set(): break
             for sym in SYMBOLS:
                 with self._lock:
                     age = time.time() - self.price_ts.get(sym, 0)
-                if age < REST_PRICE_FALLBACK_SECONDS:
-                    continue
-                try:
-                    self._set(sym, self.client.price(sym))
-                except Exception as e:
-                    logger.warning(f"REST PRICE | {sym} | {e}")
+                if age < REST_PRICE_FALLBACK_SECONDS: continue
+                try: self._set(sym, self.client.price(sym))
+                except Exception as e: logger.warning(f"REST PRICE | {sym} | {e}")
 
 # -----------------------------------------------------------------------------
 # NEWS FILTER
@@ -1170,6 +1391,19 @@ def empty_range_state(symbol: str) -> Dict[str, Any]:
     }
 
 
+def empty_scalper_state(symbol: str) -> Dict[str, Any]:
+    bankroll = configured_scalper_bankroll(symbol)
+    return {
+        "strategy": f"SCALPER:{symbol}", "symbol": symbol,
+        "bankroll": str(bankroll), "equity": str(bankroll), "realized_pnl": "0",
+        "position": None, "native_risk_stop": None, "stopped": False, "stop_reason": None,
+        "wins": 0, "losses": 0, "trades": 0,
+        "loss_streak": 0, "recovery_level": 0, "recovery_deficit": "0", "pause_until": 0,
+        "compound_multiplier": "1", "last_size_multiplier": "1",
+        "candidate_side": None, "candidate_since": None, "last_entry_attempt": 0,
+        "last_score": "0", "last_snapshot": {}, "last_result": "NONE", "last_update": now_iso(),
+    }
+
 def empty_pyramid_state(symbol: str, side: str) -> Dict[str, Any]:
     side = str(side).upper()
     return {
@@ -1235,6 +1469,7 @@ def fresh_state() -> Dict[str, Any]:
         "protection_blocks": {},
         "range": {s: empty_range_state(s) for s in SYMBOLS},
         "pyramid": {f"{s}:{side}": empty_pyramid_state(s, side) for s in SYMBOLS for side in ("LONG", "SHORT")},
+        "scalper": {s: empty_scalper_state(s) for s in SYMBOLS},
         # Bucket mantido apenas para compatibilidade com estados antigos; novos G0 não são criados.
         "pyramid_grids": {},
         "symbol_owner": {s: None for s in SYMBOLS},
@@ -1310,7 +1545,7 @@ class StateStore:
         if any(not isinstance(v, dict) for v in mp.values()):
             raise ValueError("state['pyramid'] contem entrada nao-objeto")
         required_maps = ("kill_switch", "trade_gate", "operational_blocks", "protection_blocks",
-                         "symbol_owner", "last_wallet", "maintenance", "range", "macd", "pyramid", "pyramid_grids")
+                         "symbol_owner", "last_wallet", "maintenance", "range", "macd", "pyramid", "pyramid_grids", "scalper")
         for key in required_maps:
             if key in st and not isinstance(st.get(key), dict):
                 raise ValueError(f"state[{key!r}] precisa ser objeto JSON")
@@ -1375,12 +1610,21 @@ class StateStore:
         st.setdefault("range", {})
         st.setdefault("pyramid", {})
         st.setdefault("pyramid_grids", {})
+        st.setdefault("scalper", {})
         st.setdefault("symbol_owner", {})
         st.setdefault("last_wallet", {})
         st.setdefault("maintenance", {"completed_emergency_actions": []})
         for s in SYMBOLS:
             st["range"].setdefault(s, empty_range_state(s))
             st["symbol_owner"].setdefault(s, None)
+            st["scalper"].setdefault(s, empty_scalper_state(s))
+            _sc = st["scalper"][s]
+            _sc.setdefault("loss_streak", 0)
+            _sc.setdefault("recovery_level", 0)
+            _sc.setdefault("recovery_deficit", "0")
+            _sc.setdefault("pause_until", 0)
+            _sc.setdefault("compound_multiplier", "1")
+            _sc.setdefault("last_size_multiplier", "1")
             for side in ("LONG", "SHORT"):
                 pkey = f"{s}:{side}"
                 st["pyramid"].setdefault(pkey, empty_pyramid_state(s, side))
@@ -1753,6 +1997,12 @@ class FillLedger:
                         q = dec(leg.get("qty")); ep = dec(leg.get("entry_price")); lid = str(leg.get("id") or uuid.uuid4().hex)
                         if q > 0 and ep > 0:
                             self.record_open_lot(lid, str(st.get("strategy")), str(st.get("symbol")), str(leg.get("side")), q, ep, lid, "STATE_BOOTSTRAP"); seeded += 1
+            for st in store.state.get("scalper", {}).values():
+                st = st or {}; leg = (st.get("position") or {}).get("leg") if isinstance(st.get("position"), dict) else None
+                if leg:
+                    q = dec(leg.get("qty")); ep = dec(leg.get("entry_price")); lid = str(leg.get("id") or uuid.uuid4().hex)
+                    if q > 0 and ep > 0:
+                        self.record_open_lot(lid, str(st.get("strategy")), str(st.get("symbol")), str(leg.get("side")), q, ep, lid, "STATE_BOOTSTRAP"); seeded += 1
         if seeded:
             logger.warning(f"LEDGER BOOTSTRAP | lots_seeded={seeded} from state.json")
         return seeded
@@ -1787,6 +2037,31 @@ class OrderManager:
             raise
         except Exception:
             self.ledger.order_state(client_id, strategy_id, symbol, position_side, action, "MARKET", qty,
+                                    "REJECTED", reason=reason)
+            raise
+
+    def submit_limit(self, strategy_id: str, symbol: str, position_side: str, side: str,
+                     qty: Decimal, price: Decimal, client_id: str, time_in_force: str,
+                     reason: str) -> Dict[str, Any]:
+        action = "OPEN" if side == ("BUY" if position_side == "LONG" else "SELL") else "CLOSE"
+        self.ledger.order_state(client_id, strategy_id, symbol, position_side, action,
+                                "LIMIT", qty, "CREATED", reason=reason)
+        try:
+            resp = self.client.order(symbol, side, position_side, qty, client_id, "LIMIT", price, time_in_force)
+            self.ledger.order_state(client_id, strategy_id, symbol, position_side, action, "LIMIT", qty,
+                                    str(resp.get("status") or "SUBMITTED"), resp.get("orderId"),
+                                    dec(resp.get("executedQty")), dec(resp.get("avgPrice")), reason=reason)
+            return resp
+        except AsterAPIError as e:
+            status = "UNKNOWN" if e.code == 503 else "REJECTED"
+            self.ledger.order_state(client_id, strategy_id, symbol, position_side, action, "LIMIT", qty,
+                                    status, reason=reason)
+            if status == "UNKNOWN":
+                logger.critical("LIMIT EXECUTION UNKNOWN | strategy=%s symbol=%s posSide=%s qty=%s price=%s cid=%s",
+                                strategy_id, symbol, position_side, qty, price, client_id)
+            raise
+        except Exception:
+            self.ledger.order_state(client_id, strategy_id, symbol, position_side, action, "LIMIT", qty,
                                     "REJECTED", reason=reason)
             raise
 
@@ -1838,12 +2113,15 @@ class AccountManager:
             strategy_count = (
                 (len(SYMBOLS) if RANGE_ENGINE_ENABLED else 0)
                 + (len(SYMBOLS) * 2 if PYRAMID_ENGINE_ENABLED else 0)
+                + (len(SYMBOLS) if SCALPER_ENGINE_ENABLED else 0)
             )
             simulated_total = D(0)
             if RANGE_ENGINE_ENABLED:
                 simulated_total += sum((configured_bankroll(s) for s in SYMBOLS), D(0))
             if PYRAMID_ENGINE_ENABLED:
                 simulated_total += PYRAMID_BANKROLL_USD * D(len(SYMBOLS) * 2)
+            if SCALPER_ENGINE_ENABLED:
+                simulated_total += sum((configured_scalper_bankroll(s) for s in SYMBOLS), D(0))
             if strategy_count == 0:
                 simulated_total = INITIAL_BANKROLL_USD
             self.wallet_balance = simulated_total
@@ -2296,6 +2574,79 @@ class ExecutionEngine:
                     "status": "FILLED", "time": submitted_ms, "price_source": "EXCHANGE_AVG",
                     "commission_actual": commission, "realized_pnl_exchange": realized}
 
+    def open_post_only_leg(self, strategy_id: str, symbol: str, position_side: str,
+                           sizing: Dict[str, Any], limit_price: Decimal, reason: str,
+                           wait_seconds: float = SCALPER_POST_ONLY_WAIT_SECONDS) -> Optional[Dict[str, Any]]:
+        """Submit GTX Post-Only entry; cancel unfilled remainder and accept only confirmed fill."""
+        with self.client._rate_limit_lock:
+            cooldown = max(0.0, self.client._rate_limit_until - time.time())
+        if cooldown > 0:
+            logger.warning("SCALPER OPEN BLOCK RATE LIMIT | %s | remaining=%.1fs", strategy_id, cooldown)
+            return None
+        requested_leverage = int(sizing["leverage"])
+        effective_leverage = self.account.prepare_leverage_for_open(symbol, requested_leverage)
+        if effective_leverage is None:
+            return None
+        qty = dec(sizing["qty"])
+        actual_notional = qty * limit_price
+        free = self.account.free_margin(force=True)
+        if actual_notional / D(effective_leverage) > free:
+            logger.warning("SCALPER OPEN BLOCK MARGIN | %s | notional=%s lev=%sx free=%s", strategy_id, actual_notional, effective_leverage, free)
+            return None
+        side = self.order_side(position_side, True)
+        cid = self.client_id(strategy_id, "mkopen")
+        if not LIVE_TRADING:
+            fill_qty, avg, order_id, commission = qty, limit_price, f"SIM-{cid}", D(0)
+        else:
+            try:
+                resp = self.orders.submit_limit(strategy_id, symbol, position_side, side, qty, limit_price, cid, "GTX", reason)
+            except AsterAPIError as exc:
+                # GTX rejection because the quote would cross is a normal no-trade outcome.
+                if exc.code in (-5022, -2010, -1013):
+                    logger.info("SCALPER POST_ONLY REJECT | %s | %s", strategy_id, exc)
+                    return None
+                raise
+            order_id = resp.get("orderId")
+            end = time.time() + max(0.1, wait_seconds)
+            q = resp
+            while time.time() < end:
+                status = str(q.get("status") or "").upper()
+                if status == "FILLED": break
+                try: q = self.client.query_order(symbol, cid)
+                except Exception: pass
+                if str(q.get("status") or "").upper() in ("CANCELED", "EXPIRED", "REJECTED"): break
+                time.sleep(min(0.20, ORDER_POLL_SECONDS))
+            status = str(q.get("status") or "").upper()
+            if status != "FILLED":
+                try: q = self.cancel_and_confirm_terminal(symbol, cid)
+                except Exception as exc:
+                    self.store.set_operational_block(strategy_id, f"SCALPER_POST_ONLY_CANCEL_UNCONFIRMED:{exc}")
+                    raise
+            fill_qty = dec(q.get("executedQty")); avg = dec(q.get("avgPrice"))
+            if fill_qty <= 0:
+                logger.info("SCALPER POST_ONLY NO FILL | %s | %s %s qty=%s price=%s", strategy_id, symbol, position_side, qty, limit_price)
+                return None
+            if avg <= 0: avg = limit_price
+            if not order_id: order_id = q.get("orderId")
+            commission, realized = self._actual_trade_costs(symbol, order_id, now_ms())
+            self.ledger.order_state(cid, strategy_id, symbol, position_side, "OPEN", "LIMIT", qty,
+                                    "FILLED" if fill_qty >= qty else "PARTIALLY_FILLED", order_id,
+                                    fill_qty, avg, commission, realized, reason)
+        leg = {
+            "id": cid, "side": position_side, "qty": str(fill_qty), "entry_price": str(avg),
+            "signal_price": str(sizing.get("price") or limit_price), "price_source": "POST_ONLY_GTX",
+            "leverage": effective_leverage, "requested_leverage": requested_leverage,
+            "notional": str(fill_qty * avg), "margin_est": str((fill_qty * avg) / D(effective_leverage)),
+            "opened_at": now_iso(), "reason": reason, "entry_fee_rate": str(SCALPER_MAKER_FEE_RATE),
+        }
+        self.ledger.record_open_lot(cid, strategy_id, symbol, position_side, fill_qty, avg, cid)
+        jsonl_append(TRADES_FILE, {"event":"OPEN","strategy":strategy_id,"symbol":symbol,"leg":leg,"at":now_iso()})
+        logger.warning("SCALPER MAKER FILLED | %s | %s %s qty=%s avg=%s notional=%s lev=%sx",
+                       strategy_id, symbol, position_side, fill_qty, avg, fill_qty*avg, effective_leverage)
+        try: self.account.sync(force=True)
+        except Exception: pass
+        return leg
+
     def open_leg(self, strategy_id: str, symbol: str, position_side: str, sizing: Dict[str, Any],
                  reason: str) -> Optional[Dict[str, Any]]:
         with self.client._rate_limit_lock:
@@ -2353,9 +2704,10 @@ class ExecutionEngine:
                       close_client_id: str, exit_source: str) -> Dict[str, Any]:
         entry = dec(leg["entry_price"])
         gross = (exitp - entry) * closed_qty if leg["side"] == "LONG" else (entry - exitp) * closed_qty
-        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
-        entry_fee_est = entry * closed_qty * fee_rate
-        exit_fee_est = exitp * closed_qty * fee_rate
+        entry_fee_rate = dec(leg.get("entry_fee_rate"), str(TAKER_FEE_RATE))
+        exit_fee_rate = TAKER_FEE_RATE
+        entry_fee_est = entry * closed_qty * entry_fee_rate
+        exit_fee_est = exitp * closed_qty * exit_fee_rate
         fees_est = entry_fee_est + exit_fee_est
         entry_commission_actual = D(0); exit_commission_actual = D(0); exchange_realized = D(0)
         if LIVE_TRADING:
@@ -2363,7 +2715,7 @@ class ExecutionEngine:
                 open_row = self.ledger.db.execute("SELECT commission FROM orders WHERE client_id=?", (str(leg.get("id")),)).fetchone()
                 if open_row:
                     full_open_fee = dec(open_row[0])
-                    opened_qty = max(dec(leg.get("qty")), closed_qty)
+                    opened_qty = max(dec(leg.get("original_qty") or leg.get("qty")), closed_qty)
                     if full_open_fee > 0 and opened_qty > 0:
                         entry_commission_actual = full_open_fee * (closed_qty / opened_qty)
 
@@ -3033,7 +3385,7 @@ class RangeEngine:
 
     @staticmethod
     def estimated_net_pnl(legs: List[Dict[str, Any]], exit_price: Decimal) -> Decimal:
-        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
+        fee_rate = TAKER_FEE_RATE
         total = D(0)
         for leg in legs:
             qty = dec(leg["qty"])
@@ -3051,7 +3403,7 @@ class RangeEngine:
         existing_at_tp = self.estimated_net_pnl(basket.get("legs", []), tp_price)
         base_notional = max(configured_initial_notional(self.symbol), dec(st.get("equity")))
         desired_basket_profit = dec(st.get("recovery_deficit")) + base_notional * RANGE_TAKE_PROFIT_PCT
-        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
+        fee_rate = TAKER_FEE_RATE
         move_yield = abs(tp_price - entry_price) / entry_price
         round_trip_fee_yield = fee_rate * (D(1) + tp_price / entry_price)
         net_yield = move_yield - round_trip_fee_yield
@@ -3547,7 +3899,7 @@ class PyramidEngine:
 
     def _net_unrealized(self, price: Decimal) -> Decimal:
         st = self.st()
-        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
+        fee_rate = TAKER_FEE_RATE
         total = D(0)
         for leg in st.get("legs", []) or []:
             q = dec(leg.get("qty")); ep = dec(leg.get("entry_price"))
@@ -3664,7 +4016,7 @@ class PyramidEngine:
 
         share = dec(st.get("capital_share", "1"))
         max_loss = PYRAMID_MAX_LOSS_USD * share
-        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
+        fee_rate = TAKER_FEE_RATE
 
         if self.side == "LONG":
             denom = q_total * (D(1) - fee_rate)
@@ -4030,6 +4382,402 @@ class PyramidEngine:
             processed += 1
 
 # -----------------------------------------------------------------------------
+# MICRO SCALPER — BOOK + TAPE + MICROPRICE
+# -----------------------------------------------------------------------------
+
+class ScalperEngine:
+    def __init__(self, symbol: str, client: AsterClient, md: MarketData, news: NewsFilter,
+                 account: AccountManager, exe: ExecutionEngine, store: StateStore):
+        self.symbol = symbol; self.id = f"SCALPER:{symbol}"
+        self.client = client; self.md = md; self.news = news; self.account = account; self.exe = exe; self.store = store
+
+    def st(self) -> Dict[str, Any]: return self.store.state["scalper"][self.symbol]
+
+    def _recovery_level(self) -> int:
+        try: level = int(self.st().get("recovery_level", 0))
+        except Exception: level = 0
+        return max(0, min(level, SCALPER_RECOVERY_MAX_LEVEL))
+
+    def _recovery_multiplier(self, level: Optional[int] = None) -> Decimal:
+        lvl = self._recovery_level() if level is None else max(0, min(int(level), SCALPER_RECOVERY_MAX_LEVEL))
+        return SCALPER_RECOVERY_MULTIPLIERS[lvl]
+
+    def _compound_multiplier(self) -> Decimal:
+        st = self.st()
+        if not SCALPER_COMPOUND_ENABLED or dec(st.get("recovery_deficit")) > 0:
+            return D(1)
+        base = configured_scalper_bankroll(self.symbol)
+        if base <= 0:
+            return D(1)
+        realized = max(D(0), dec(st.get("realized_pnl")))
+        factor = D(1) + (realized / base) * SCALPER_COMPOUND_PROFIT_SHARE
+        return max(D(1), min(SCALPER_COMPOUND_MAX_MULTIPLIER, factor))
+
+    def _entry_allowed(self) -> bool:
+        st = self.st()
+        if st.get("stopped") or self.store.killed() != "OFF": return False
+        pause_until = float(st.get("pause_until") or 0)
+        if pause_until > time.time():
+            return False
+        ok, _ = self.store.entry_allowed()
+        if not ok or not self.md.is_fresh(self.symbol): return False
+        if SCALPER_APPLY_NEWS_FILTER:
+            blocked, why = self.news.blocked()
+            if blocked:
+                logger.info("SCALPER NEWS BLOCK | %s | %s", self.id, why); return False
+        return True
+
+    @staticmethod
+    def _clamp(x: Decimal, lo: Decimal, hi: Decimal) -> Decimal: return max(lo, min(hi, x))
+
+    def _exit_liquidity(self, side: str, qty: Decimal, snap: Dict[str, Any]) -> Dict[str, Any]:
+        """Estimate market-exit depth/impact using the current top-20 book.
+
+        LONG exits by SELLING into bids. SHORT exits by BUYING into asks.
+        This is an execution-risk estimate, not a guarantee: depth may vanish before fill.
+        """
+        side = str(side).upper(); qty = max(D(0), dec(qty))
+        levels = snap.get("bid_levels") if side == "LONG" else snap.get("ask_levels")
+        levels = list(levels or [])
+        best = dec(snap.get("bid" if side == "LONG" else "ask"))
+        depth_usd = dec(snap.get("bid_depth_usd" if side == "LONG" else "ask_depth_usd"))
+        remaining = qty; filled = D(0); notion = D(0)
+        for raw_px, raw_q in levels:
+            px, avail = dec(raw_px), dec(raw_q)
+            if px <= 0 or avail <= 0 or remaining <= 0: continue
+            take = min(remaining, avail)
+            notion += take * px; filled += take; remaining -= take
+        avg = notion / filled if filled > 0 else D(0)
+        if best > 0 and avg > 0:
+            slippage = (best - avg) / best if side == "LONG" else (avg - best) / best
+            slippage = max(D(0), slippage)
+        else:
+            slippage = D(1)
+        mark_notional = qty * best if best > 0 else D(0)
+        participation = mark_notional / depth_usd if depth_usd > 0 else D(1)
+        return {
+            "best": best, "depth_usd": depth_usd, "requested_qty": qty,
+            "filled_top5_qty": filled, "remaining_qty": max(D(0), remaining),
+            "avg_px": avg, "slippage_pct": slippage, "participation": participation,
+            "sufficient_top5": remaining <= D("0.0000000001"),
+        }
+
+    def _liquidity_cap_notional(self, side: str, snap: Dict[str, Any]) -> Decimal:
+        depth = dec(snap.get("bid_depth_usd" if side == "LONG" else "ask_depth_usd"))
+        return max(D(0), depth * SCALPER_MAX_BOOK_PARTICIPATION)
+
+    def _sizing(self, price: Decimal, stop_pct: Decimal, side: str, snap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        st = self.st(); eq = dec(st.get("equity"), str(configured_scalper_bankroll(self.symbol)))
+        if eq <= 0: return None
+
+        level = self._recovery_level()
+        recovery_mult = self._recovery_multiplier(level)
+        compound_mult = self._compound_multiplier()
+        base_notional = configured_scalper_initial_notional(self.symbol)
+        desired_raw = base_notional * compound_mult * recovery_mult
+        liquidity_cap = self._liquidity_cap_notional(side, snap)
+        if liquidity_cap <= 0:
+            logger.info("SCALPER LIQUIDITY BLOCK | %s | side=%s reason=NO_EXIT_DEPTH", self.id, side); return None
+        desired = min(desired_raw, liquidity_cap)
+        if desired <= 0: return None
+
+        qty = self.exe.rules.qty(self.symbol, desired / price, price)
+        actual = qty * price
+        max_allowed = desired * (D(1) + MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT)
+        if actual > max_allowed:
+            logger.info("SCALPER SIZING BLOCK | %s | desired=%s raw=%s liquidity_cap=%s actual=%s max=%s",
+                        self.id, desired, desired_raw, liquidity_cap, actual, max_allowed); return None
+
+        liq = self._exit_liquidity(side, qty, snap)
+        if not liq["sufficient_top5"]:
+            logger.info("SCALPER LIQUIDITY BLOCK | %s | side=%s qty=%s top5_fill=%s depth_usd=%s reason=TOP5_INSUFFICIENT",
+                        self.id, side, qty, liq["filled_top5_qty"], liq["depth_usd"]); return None
+        if dec(liq["participation"]) > SCALPER_MAX_BOOK_PARTICIPATION:
+            logger.info("SCALPER LIQUIDITY BLOCK | %s | side=%s participation=%s max=%s",
+                        self.id, side, liq["participation"], SCALPER_MAX_BOOK_PARTICIPATION); return None
+        if dec(liq["slippage_pct"]) > SCALPER_MAX_EXIT_SLIPPAGE_PCT:
+            logger.info("SCALPER LIQUIDITY BLOCK | %s | side=%s projected_slippage=%s max=%s avg=%s best=%s",
+                        self.id, side, liq["slippage_pct"], SCALPER_MAX_EXIT_SLIPPAGE_PCT, liq["avg_px"], liq["best"]); return None
+
+        risk = actual * stop_pct + actual * (SCALPER_MAKER_FEE_RATE + SCALPER_TAKER_FEE_RATE)
+        realized = dec(st.get("realized_pnl"))
+        remaining_abs_loss_budget = max(D(0), SCALPER_MAX_LOSS_USD + realized)
+        risk_budget = min(eq * SCALPER_MAX_RISK_FRACTION, remaining_abs_loss_budget)
+        if risk_budget <= 0 or risk > risk_budget:
+            logger.info("SCALPER RISK BLOCK | %s | estimated=%s risk_budget=%s eq=%s recovery_level=%s size_mult=%s",
+                        self.id, risk, risk_budget, eq, level, recovery_mult); return None
+
+        free = self.account.free_margin(force=True)
+        lev = min(SCALPER_LEVERAGE, PYRAMID_MAX_EFFECTIVE_LEVERAGE)
+        if actual / D(lev) > free: return None
+        if self.account.current_symbol_notional(self.symbol) + actual > configured_max_total_symbol_notional(self.symbol):
+            return None
+
+        st["compound_multiplier"] = str(compound_mult)
+        st["last_size_multiplier"] = str(compound_mult * recovery_mult)
+        self.store.save()
+        logger.info(
+            "SCALPER LIQUIDITY ENTRY OK | %s | side=%s desired_raw=%s desired_liq=%s actual=%s depth_usd=%s participation=%s projected_exit_slippage=%s recovery_level=%s recovery_mult=%sx compound_mult=%sx",
+            self.id, side, desired_raw, desired, actual, liq["depth_usd"], liq["participation"], liq["slippage_pct"], level, recovery_mult, compound_mult,
+        )
+        return {"leverage":lev,"qty":qty,"price":price,"notional":actual,"margin":actual/D(lev),
+                "estimated_adverse_loss":risk,"target_profit":D(0),"recovery_level":level,
+                "desired_notional_override":desired,"recovery_multiplier":str(recovery_mult),"meta":{
+                    "engine":"MICRO_SCALPER","base_notional":str(base_notional),
+                    "compound_multiplier":str(compound_mult),"recovery_multiplier":str(recovery_mult),
+                    "desired_raw":str(desired_raw),"liquidity_cap":str(liquidity_cap),
+                    "exit_depth_usd":str(liq["depth_usd"]),"exit_participation":str(liq["participation"]),
+                    "projected_exit_slippage":str(liq["slippage_pct"]),
+                }}
+
+    def _signal(self, snap: Dict[str, Any]) -> Tuple[Optional[str], Decimal, Decimal, Decimal, str]:
+        spread = dec(snap.get("spread_pct")); r5 = dec(snap.get("range_5s")); score = dec(snap.get("score"))
+        depth = dec(snap.get("depth_imbalance")); tape = dec(snap.get("tape_imbalance")); mom1 = dec(snap.get("momentum_1s"))
+        if spread <= 0 or spread > SCALPER_MAX_SPREAD_PCT: return None, D(0), D(0), score, "SPREAD"
+        if r5 < SCALPER_MIN_RANGE_PCT: return None, D(0), D(0), score, "RANGE_TOO_LOW"
+        if r5 > SCALPER_MAX_RANGE_PCT: return None, D(0), D(0), score, "RANGE_TOO_HIGH"
+
+        level = self._recovery_level()
+        score_req = min(D("0.95"), SCALPER_SCORE_THRESHOLD + SCALPER_RECOVERY_SCORE_STEP * D(level))
+        depth_req = min(D("0.95"), SCALPER_MIN_DEPTH_IMBALANCE + SCALPER_RECOVERY_DEPTH_STEP * D(level))
+        tape_req = min(D("0.95"), SCALPER_MIN_TAPE_IMBALANCE + SCALPER_RECOVERY_TAPE_STEP * D(level))
+        side = None
+        if score >= score_req and depth >= depth_req and tape >= tape_req and mom1 > -SCALPER_MOMENTUM_NORM_PCT:
+            side = "LONG"
+        elif score <= -score_req and depth <= -depth_req and tape <= -tape_req and mom1 < SCALPER_MOMENTUM_NORM_PCT:
+            side = "SHORT"
+        if side is None: return None, D(0), D(0), score, f"NO_CONFLUENCE_RECOVERY_L{level}"
+
+        economic_floor = SCALPER_MAKER_FEE_RATE + SCALPER_TAKER_FEE_RATE + SCALPER_MIN_NET_EDGE_PCT
+        target = max(SCALPER_MIN_TARGET_PCT, economic_floor, spread * D("2.0"), r5 * D("0.55"))
+        target = min(SCALPER_MAX_TARGET_PCT, target)
+        stop = max(SCALPER_MIN_STOP_PCT, target * D("1.6"), r5 * D("1.10"))
+        stop = min(SCALPER_MAX_STOP_PCT, stop)
+        if target <= SCALPER_MAKER_FEE_RATE + SCALPER_TAKER_FEE_RATE:
+            return None, target, stop, score, "NO_NET_EDGE"
+        return side, target, stop, score, "OK"
+
+    def _install_stop(self, st: Dict[str, Any], leg: Dict[str, Any], stop_price: Decimal, ref: Decimal) -> bool:
+        try:
+            native = self.exe.install_basket_exit(self.id, self.symbol, [leg], stop_price, ref)
+            if not native: return not NATIVE_PROTECTIVE_ORDERS
+            st["native_risk_stop"] = native; self.store.set_protection_block(self.id, None); self.store.save(); return True
+        except Exception as exc:
+            self.store.set_protection_block(self.id, f"SCALPER_NATIVE_STOP_INSTALL_FAILED:{exc}")
+            logger.exception("SCALPER STOP INSTALL FAIL | %s | %s", self.id, exc); return False
+
+    def _consume_stop(self, ref: Decimal) -> bool:
+        st = self.st(); pos = st.get("position"); native = st.get("native_risk_stop")
+        if not pos or not native: return False
+        leg = pos.get("leg")
+        try: consumed = self.exe.consume_basket_exit(self.id, self.symbol, [leg], native, ref, "SCALPER_NATIVE_STOP")
+        except Exception as exc:
+            logger.exception("SCALPER STOP CONSUME FAIL | %s | %s", self.id, exc); return False
+        if not consumed: return False
+        total, closes = consumed
+        self._finalize_close(total, "NATIVE_STOP")
+        logger.warning("SCALPER NATIVE STOP FILLED | %s | pnl=%s", self.id, total)
+        return True
+
+    def pre_reconcile(self, ref: Optional[Decimal] = None) -> None:
+        st = self.st()
+        if st.get("position") and st.get("native_risk_stop"):
+            px = ref or dec((st.get("position") or {}).get("entry_price")) or dec(((st.get("position") or {}).get("leg") or {}).get("entry_price"))
+            if px > 0: self._consume_stop(px)
+
+    def _finalize_close(self, pnl: Decimal, reason: str) -> None:
+        st = self.st(); pnl = dec(pnl)
+        st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl)
+        st["equity"] = str(configured_scalper_bankroll(self.symbol) + dec(st["realized_pnl"]))
+        st["position"] = None; st["native_risk_stop"] = None; st["candidate_side"] = None; st["candidate_since"] = None
+        st["trades"] = int(st.get("trades",0)) + 1; st["last_result"] = reason; st["last_update"] = now_iso()
+
+        deficit = max(D(0), dec(st.get("recovery_deficit")))
+        level = self._recovery_level()
+        streak = max(0, int(st.get("loss_streak", 0) or 0))
+        if pnl < 0:
+            st["losses"] = int(st.get("losses",0))+1
+            deficit += -pnl
+            streak += 1
+            level = min(SCALPER_RECOVERY_MAX_LEVEL, level + 1)
+            if streak >= SCALPER_LOSS_PAUSE_AFTER_STREAK and SCALPER_LOSS_PAUSE_SECONDS > 0:
+                st["pause_until"] = time.time() + SCALPER_LOSS_PAUSE_SECONDS
+                logger.warning("SCALPER LOSS PAUSE | %s | streak=%s pause=%ss", self.id, streak, SCALPER_LOSS_PAUSE_SECONDS)
+        elif pnl > 0:
+            st["wins"] = int(st.get("wins",0))+1
+            deficit = max(D(0), deficit - pnl)
+            streak = 0
+            if deficit <= 0:
+                level = 0
+            elif level > 1:
+                # Recovery parcial reduz a exposicao um degrau: recupera sem permanecer no maximo.
+                level -= 1
+            st["pause_until"] = 0
+
+        st["recovery_deficit"] = str(deficit)
+        st["recovery_level"] = level
+        st["loss_streak"] = streak
+        st["compound_multiplier"] = str(self._compound_multiplier())
+        st["last_size_multiplier"] = str(self._compound_multiplier() * self._recovery_multiplier(level))
+
+        if dec(st.get("realized_pnl")) <= -SCALPER_MAX_LOSS_USD or dec(st.get("equity")) <= 0:
+            st["stopped"] = True; st["stop_reason"] = f"SCALPER_MAX_LOSS reached realized={st['realized_pnl']}"
+        self.store.save()
+        logger.warning(
+            "SCALPER RESULT | %s | pnl=%s realized=%s equity=%s RD=%s recovery_level=%s recovery_mult=%sx compound_mult=%sx streak=%s stopped=%s",
+            self.id, pnl, st["realized_pnl"], st["equity"], st["recovery_deficit"], level,
+            self._recovery_multiplier(level), st["compound_multiplier"], streak, st.get("stopped"),
+        )
+
+    def _close_market(self, ref: Decimal, reason: str) -> bool:
+        """Liquidity-aware voluntary exit.
+
+        The native stop is first cancelled and confirmed. Normal TP/time exits are then
+        split only when current top-20 liquidity suggests that one market order would be
+        too large. Emergency/native stops remain exchange-side and are never delayed for liquidity.
+        """
+        st = self.st(); pos = st.get("position") or {}; leg = pos.get("leg")
+        if not leg: return False
+        native = st.get("native_risk_stop")
+        if native:
+            try: self.exe.cancel_basket_exit(self.symbol, native)
+            except Exception as exc:
+                self.store.set_operational_block(self.id, f"SCALPER_STOP_CANCEL_UNCONFIRMED:{exc}"); return False
+        st["native_risk_stop"] = None; self.store.save()
+
+        original_qty = dec(leg.get("qty")); remaining = original_qty; total_pnl = D(0); chunks = 0
+        step = self.exe.rules.rules[self.symbol].step_size
+        while remaining > 0 and chunks < max(1, SCALPER_MAX_EXIT_CHUNKS):
+            snap = self.md.micro_snapshot(self.symbol)
+            chunk_qty = remaining
+            if snap:
+                side = str(leg.get("side"))
+                best = dec(snap.get("bid" if side == "LONG" else "ask"))
+                depth = dec(snap.get("bid_depth_usd" if side == "LONG" else "ask_depth_usd"))
+                cap_notional = depth * SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION
+                if best > 0 and cap_notional > 0:
+                    cap_qty = floor_step(cap_notional / best, step)
+                    if cap_qty > 0:
+                        chunk_qty = min(remaining, cap_qty)
+                # Reduce the chunk until projected top-20 slippage fits, when possible.
+                probe = chunk_qty
+                while probe > step:
+                    liq = self._exit_liquidity(side, probe, snap)
+                    if liq["sufficient_top5"] and dec(liq["slippage_pct"]) <= SCALPER_MAX_EXIT_SLIPPAGE_PCT:
+                        chunk_qty = probe; break
+                    probe = floor_step(probe / D(2), step)
+                liq = self._exit_liquidity(side, chunk_qty, snap)
+                logger.warning(
+                    "SCALPER LIQUIDITY EXIT | %s | reason=%s chunk=%s remaining_before=%s depth_usd=%s participation=%s projected_slippage=%s top5_sufficient=%s",
+                    self.id, reason, chunk_qty, remaining, liq["depth_usd"], liq["participation"], liq["slippage_pct"], liq["sufficient_top5"],
+                )
+            else:
+                logger.warning("SCALPER LIQUIDITY EXIT | %s | microdata indisponivel; priorizando encerramento", self.id)
+
+            if chunk_qty <= 0:
+                chunk_qty = remaining
+            subleg = dict(leg); subleg["qty"] = str(chunk_qty); subleg["original_qty"] = str(original_qty)
+            rec = self.exe.close_leg(self.id, self.symbol, subleg, ref, reason)
+            if not rec:
+                break
+            closed = dec(rec.get("qty"))
+            if closed <= 0:
+                break
+            total_pnl += dec(rec.get("pnl_est")); remaining = max(D(0), remaining - closed); chunks += 1
+            if remaining > 0 and SCALPER_EXIT_CHUNK_SLEEP_SECONDS > 0:
+                time.sleep(SCALPER_EXIT_CHUNK_SLEEP_SECONDS)
+
+        if remaining > 0:
+            # Safety beats market impact: after the configured chunk budget, make one final
+            # market attempt rather than leave an unprotected residual indefinitely.
+            logger.critical("SCALPER EXIT LIQUIDITY FALLBACK | %s | remaining=%s reason=%s", self.id, remaining, reason)
+            subleg = dict(leg); subleg["qty"] = str(remaining); subleg["original_qty"] = str(original_qty)
+            rec = self.exe.close_leg(self.id, self.symbol, subleg, ref, f"{reason}_FINAL_LIQUIDITY_FALLBACK")
+            if rec:
+                closed = dec(rec.get("qty")); total_pnl += dec(rec.get("pnl_est")); remaining = max(D(0), remaining - closed)
+
+        if remaining > 0:
+            # Could not prove full close. Keep state for the residual and restore its native stop.
+            residual_leg = dict(leg); residual_leg["qty"] = str(remaining); residual_leg["original_qty"] = str(original_qty)
+            pos["leg"] = residual_leg; st["position"] = pos; self.store.save()
+            stop_px = dec(pos.get("stop_price"))
+            if stop_px > 0:
+                self._install_stop(st, residual_leg, stop_px, ref)
+            self.store.set_operational_block(self.id, f"SCALPER_PARTIAL_EXIT_REMAINS:{remaining}")
+            logger.critical("SCALPER PARTIAL EXIT | %s | remaining=%s | state preservado + stop restaurado", self.id, remaining)
+            return False
+
+        self.store.set_operational_block(self.id, None)
+        self._finalize_close(total_pnl, reason); return True
+
+    def _open(self, side: str, snap: Dict[str, Any], target_pct: Decimal, stop_pct: Decimal) -> None:
+        st = self.st(); bid=dec(snap["bid"]); ask=dec(snap["ask"])
+        rule = self.exe.rules.rules[self.symbol]
+        maker_price = floor_step(bid, rule.tick_size) if side == "LONG" else ceil_step(ask, rule.tick_size)
+        sizing = self._sizing(maker_price, stop_pct, side, snap)
+        if not sizing: return
+        leg = self.exe.open_post_only_leg(self.id, self.symbol, side, sizing, maker_price, "SCALPER_BOOK_TAPE", SCALPER_POST_ONLY_WAIT_SECONDS)
+        st["last_entry_attempt"] = time.time()
+        if not leg: self.store.save(); return
+        leg["original_qty"] = str(leg.get("qty"))
+        entry = dec(leg["entry_price"])
+        tp = entry * (D(1)+target_pct) if side=="LONG" else entry * (D(1)-target_pct)
+        sl = entry * (D(1)-stop_pct) if side=="LONG" else entry * (D(1)+stop_pct)
+        tp = self.exe.rules.trigger_price(self.symbol, tp, "UP" if side=="LONG" else "DOWN")
+        sl = self.exe.rules.trigger_price(self.symbol, sl, "DOWN" if side=="LONG" else "UP")
+        st["position"] = {"side":side,"leg":leg,"entry_price":str(entry),"tp_price":str(tp),"stop_price":str(sl),
+                          "target_pct":str(target_pct),"stop_pct":str(stop_pct),"opened_epoch":time.time(),"opened_at":now_iso(),
+                          "recovery_level":self._recovery_level(),"recovery_deficit":str(st.get("recovery_deficit","0")),
+                          "compound_multiplier":str(st.get("compound_multiplier","1")),"size_multiplier":str(st.get("last_size_multiplier","1")),
+                          "entry_score":str(snap.get("score")),"entry_snapshot":{k:str(v) for k,v in snap.items() if isinstance(v,Decimal)}}
+        st["candidate_side"] = None; st["candidate_since"] = None; st["last_update"] = now_iso(); self.store.save()
+        if not self._install_stop(st, leg, sl, entry):
+            logger.critical("SCALPER PROTECTION FAIL | %s | fechando entrada", self.id)
+            self._close_market(entry, "PROTECTION_INSTALL_FAILED"); return
+        logger.warning("SCALPER OPEN | %s | side=%s maker_entry=%s qty=%s target=%s stop=%s score=%s spread=%s depth=%s tape=%s recovery_level=%s size_mult=%sx",
+                       self.id, side, entry, leg.get("qty"), tp, sl, snap.get("score"), snap.get("spread_pct"), snap.get("depth_imbalance"), snap.get("tape_imbalance"),
+                       self._recovery_level(), st.get("last_size_multiplier"))
+
+    def diagnostic(self) -> Dict[str, Any]:
+        st=self.st(); snap=self.md.micro_snapshot(self.symbol)
+        if st.get("stopped"): return {"status":"STOPPED","reason":st.get("stop_reason")}
+        pause_left=max(0.0,float(st.get("pause_until") or 0)-time.time())
+        if pause_left>0: return {"status":"LOSS_PAUSE","remaining_s":pause_left,"streak":st.get("loss_streak"),"recovery_level":st.get("recovery_level")}
+        if st.get("position"):
+            pos=st["position"]; return {"status":"POSITION","side":pos.get("side"),"entry":pos.get("entry_price"),"tp":pos.get("tp_price"),"stop":pos.get("stop_price"),"score":st.get("last_score"),
+                                       "recovery_level":st.get("recovery_level"),"RD":st.get("recovery_deficit"),"compound":st.get("compound_multiplier"),"size_mult":st.get("last_size_multiplier")}
+        if not snap: return {"status":"WAITING_MICRODATA"}
+        side,target,stop,score,why=self._signal(snap)
+        return {"status":"READY" if side else "WAITING_SIGNAL","side":side,"reason":why,"score":score,"spread":snap.get("spread_pct"),"range5":snap.get("range_5s"),"depth":snap.get("depth_imbalance"),"tape":snap.get("tape_imbalance"),"target_pct":target,"stop_pct":stop,
+                "recovery_level":st.get("recovery_level"),"RD":st.get("recovery_deficit"),"compound":self._compound_multiplier(),"size_mult":self._compound_multiplier()*self._recovery_multiplier()}
+
+    def tick(self, ref: Decimal) -> None:
+        st=self.st()
+        if st.get("position"):
+            if self._consume_stop(ref): return
+            pos=st.get("position") or {}; side=str(pos.get("side")); tp=dec(pos.get("tp_price")); opened=float(pos.get("opened_epoch") or time.time())
+            if (side=="LONG" and ref>=tp) or (side=="SHORT" and ref<=tp):
+                self._close_market(ref, "SCALPER_TAKE_PROFIT"); return
+            if time.time()-opened >= SCALPER_MAX_HOLD_SECONDS:
+                self._close_market(ref, "SCALPER_TIME_EXIT"); return
+            return
+        if not self._entry_allowed(): return
+        snap=self.md.micro_snapshot(self.symbol)
+        if not snap: return
+        side,target,stop,score,why=self._signal(snap)
+        st["last_score"]=str(score); st["last_snapshot"]={k:str(v) for k,v in snap.items() if isinstance(v,Decimal)}
+        if not side:
+            st["candidate_side"]=None; st["candidate_since"]=None; return
+        level=self._recovery_level()
+        cooldown=SCALPER_ENTRY_COOLDOWN_SECONDS + SCALPER_RECOVERY_COOLDOWN_STEP_SECONDS*level
+        confirm=SCALPER_SIGNAL_CONFIRM_SECONDS + SCALPER_RECOVERY_CONFIRM_STEP_SECONDS*level
+        if time.time()-float(st.get("last_entry_attempt") or 0) < cooldown: return
+        if st.get("candidate_side") != side:
+            st["candidate_side"]=side; st["candidate_since"]=time.time(); self.store.save(); return
+        if time.time()-float(st.get("candidate_since") or time.time()) < confirm: return
+        self._open(side,snap,target,stop)
+
+# -----------------------------------------------------------------------------
 # STARTUP RECONCILIATION + KILL SWITCH
 # -----------------------------------------------------------------------------
 
@@ -4083,6 +4831,12 @@ class Reconciler:
                 default_side = str(st.get("side") or "").upper()
                 for leg in st.get("legs", []) or []:
                     add(sym, leg.get("side") or default_side, leg.get("qty"))
+
+            # Independent micro-scalper: one live leg per symbol at most.
+            for st in self.store.state.get("scalper", {}).values():
+                if not isinstance(st, dict): continue
+                pos = st.get("position") or {}; leg = pos.get("leg") if isinstance(pos, dict) else None
+                if leg: add(st.get("symbol"), leg.get("side"), leg.get("qty"))
 
         return out
 
@@ -4173,6 +4927,12 @@ class Reconciler:
                     st["stop_reason"] = "EXCHANGE_FLAT_RECOVERY_UNACCOUNTED"
                     st["last_update"] = now_iso()
                     changed += 1
+            for st in self.store.state.get("scalper", {}).values():
+                if not isinstance(st, dict) or str(st.get("symbol") or "").upper()!=symbol: continue
+                pos=st.get("position") or {}; leg=pos.get("leg") if isinstance(pos,dict) else None
+                if leg and str(leg.get("side") or "").upper()==side:
+                    st["position"]=None; st["native_risk_stop"]=None; st["stopped"]=True
+                    st["stop_reason"]="EXCHANGE_FLAT_RECOVERY_UNACCOUNTED"; st["last_update"]=now_iso(); changed += 1
             if changed:
                 maintenance = self.store.state.setdefault("maintenance", {})
                 rec = maintenance.setdefault("exchange_flat_recoveries", [])
@@ -4221,7 +4981,7 @@ class Reconciler:
                     if n:
                         repaired_flat_sides.append((sym, side, n))
                         logger.warning(
-                            "RECONCILE | AUTO-REPAIRED FLAT PYRAMID SIDE | %s %s | ghost_lots=%s state_records=%s | ladder=STOPPED_UNACCOUNTED | opposite_side_untouched",
+                            "RECONCILE | AUTO-REPAIRED FLAT BOT SIDE | %s %s | ghost_lots=%s state_records=%s | ladder=STOPPED_UNACCOUNTED | opposite_side_untouched",
                             sym, side, n, cleared_state,
                         )
                 except Exception as exc:
@@ -4396,6 +5156,15 @@ def run_internal_regression_checks() -> None:
     assert PYRAMID_STEP_PCT > 0 and D(0) < PYRAMID_ADD_FREE_MARGIN_PCT <= D(1)
     assert PYRAMID_LEVERAGE >= 1 and PYRAMID_MAX_LOSS_USD > 0
     assert PYRAMID_NATIVE_STOP_REFRESH_SECONDS >= 1
+    assert SCALPER_BANKROLL_USD > 0 and BTC_SCALPER_BANKROLL_USD > 0
+    assert SCALPER_ENGINE_ENABLED in (True, False)
+    assert SCALPER_MIN_TARGET_PCT > SCALPER_MAKER_FEE_RATE
+    assert SCALPER_MAX_STOP_PCT >= SCALPER_MIN_STOP_PCT
+    assert SCALPER_RECOVERY_MULTIPLIERS[0] == D(1) and SCALPER_RECOVERY_MULTIPLIERS[-1] <= D(3)
+    assert SCALPER_COMPOUND_MAX_MULTIPLIER >= D(1) and D(0) <= SCALPER_COMPOUND_PROFIT_SHARE <= D(1)
+    assert D(0) < SCALPER_MAX_BOOK_PARTICIPATION <= D("0.25")
+    assert D(0) < SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION <= D("0.50")
+    assert SCALPER_MAX_EXIT_SLIPPAGE_PCT > 0
 
     # Regression: realized PnL must clear RD exactly when it covers prior loss.
     _t = {"equity":"10", "realized_pnl":"0", "recovery_deficit":"1", "wins":0, "losses":0}
@@ -4405,7 +5174,7 @@ def run_internal_regression_checks() -> None:
     _apply_realized_pnl_to_state(_t2, D("0.75"), D("100"), "TEST_RECOVERY_PARTIAL")
     assert dec(_t2["recovery_deficit"]) == D("0.25")
     assert D("100") * D("0.05") * D("10") == D("50")
-    logger.info("SELF TEST | PASS | single-pyramid/real-free-margin/native-risk-stop/range-retire/recovery/risk/tick invariants")
+    logger.info("SELF TEST | PASS | single-pyramid+micro-scalper/book-tape/post-only/native-risk-stop/progressive-recovery/compound/liquidity-aware-exit invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -4435,6 +5204,9 @@ class Bot:
         self.reconciler = Reconciler(self.client, self.store, self.ledger, self.rules)
         self.range_engines: List[RangeEngine] = []
         self.pyramid_engines: List[PyramidEngine] = []
+        self.scalper_engines: List[ScalperEngine] = [
+            ScalperEngine(sym, self.client, self.md, self.news, self.account, self.exe, self.store) for sym in SYMBOLS
+        ] if SCALPER_ENGINE_ENABLED else []
         self.last_hb = 0.0
 
     def _apply_leverage_retire_close_to_state(self, symbol: str, side: str, leg_id: str, pnl_delta: Decimal) -> None:
@@ -4857,10 +5629,16 @@ class Bot:
         logger.info(f"{BOT_NAME} | version={VERSION} | LIVE_TRADING={LIVE_TRADING}")
         validate_runtime_config()
         logger.info("CONFIG GUARD | PASS | configuracao coerente antes de rede/ordens")
-        logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False (legacy positions auto-close on startup) | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} architecture=SINGLE_LONG_SHORT_PER_SYMBOL | INDICADORES=NONE")
+        logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} | SCALPER={SCALPER_ENGINE_ENABLED} analysis=BOOK+TAPE+MICROPRICE")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
         logger.info(f"PYRAMID CAPITAL | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT}")
-        logger.info(f"PYRAMID RISK | step={PYRAMID_STEP_PCT} target_leverage={PYRAMID_LEVERAGE}x effective_leverage_cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} | pre_v56_one_shot_retire={RETIRE_PRE_V56_PYRAMID_ON_STARTUP} | legacy_overleverage_flag={NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP}")
+        logger.info(f"PYRAMID RISK | step={PYRAMID_STEP_PCT} target_leverage={PYRAMID_LEVERAGE}x effective_leverage_cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} fee_model_taker={TAKER_FEE_RATE} | pre_v56_one_shot_retire={RETIRE_PRE_V56_PYRAMID_ON_STARTUP} | legacy_overleverage_flag={NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP}")
+        logger.info(f"SCALPER CAPITAL | bankroll BTC={BTC_SCALPER_BANKROLL_USD} ETH/HYPE={SCALPER_BANKROLL_USD} | notional BTC={BTC_SCALPER_INITIAL_NOTIONAL_USD} ETH/HYPE={SCALPER_INITIAL_NOTIONAL_USD} | lev={SCALPER_LEVERAGE}x")
+        logger.info(f"SCALPER SIGNAL | spread_max={SCALPER_MAX_SPREAD_PCT} range5={SCALPER_MIN_RANGE_PCT}..{SCALPER_MAX_RANGE_PCT} score={SCALPER_SCORE_THRESHOLD} depth_min={SCALPER_MIN_DEPTH_IMBALANCE} tape_min={SCALPER_MIN_TAPE_IMBALANCE} confirm={SCALPER_SIGNAL_CONFIRM_SECONDS}s")
+        logger.info(f"SCALPER EXIT/RISK | maker_fee={SCALPER_MAKER_FEE_RATE} taker_fee={SCALPER_TAKER_FEE_RATE} target={SCALPER_MIN_TARGET_PCT}..{SCALPER_MAX_TARGET_PCT} stop={SCALPER_MIN_STOP_PCT}..{SCALPER_MAX_STOP_PCT} hold_max={SCALPER_MAX_HOLD_SECONDS}s max_loss_bankroll={SCALPER_MAX_LOSS_USD}")
+        logger.info(f"SCALPER RECOVERY | multipliers={SCALPER_RECOVERY_MULTIPLIERS} signal_steps=score+{SCALPER_RECOVERY_SCORE_STEP}/depth+{SCALPER_RECOVERY_DEPTH_STEP}/tape+{SCALPER_RECOVERY_TAPE_STEP} confirm_step={SCALPER_RECOVERY_CONFIRM_STEP_SECONDS}s cooldown_step={SCALPER_RECOVERY_COOLDOWN_STEP_SECONDS}s pause={SCALPER_LOSS_PAUSE_AFTER_STREAK}loss/{SCALPER_LOSS_PAUSE_SECONDS}s")
+        logger.info(f"SCALPER COMPOUND | enabled={SCALPER_COMPOUND_ENABLED} reinvest_profit_share={SCALPER_COMPOUND_PROFIT_SHARE} max_mult={SCALPER_COMPOUND_MAX_MULTIPLIER}x | disabled_during_recovery=True")
+        logger.info(f"SCALPER LIQUIDITY | entry_max_top20_participation={SCALPER_MAX_BOOK_PARTICIPATION} exit_chunk_participation={SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION} max_projected_slippage={SCALPER_MAX_EXIT_SLIPPAGE_PCT} max_chunks={SCALPER_MAX_EXIT_CHUNKS}")
         logger.info(f"NEWS 3-STAR={NEWS_FILTER_ENABLED} | janela=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | fail_closed={NEWS_FAIL_CLOSED}")
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
         logger.info(f"HARDENING | state_backup={STATE_BACKUP_FILE} | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
@@ -4887,6 +5665,11 @@ class Bot:
             self._migrate_single_g0_to_legacy()
             if LEDGER_RECONCILE_ON_STARTUP:
                 self.ledger.bootstrap_from_state(self.store)
+            # Consume any SCALPER native stop that may have filled while the process was offline
+            # before comparing ledger/state against physical exchange positions.
+            for _se in self.scalper_engines:
+                try: _se.pre_reconcile(self.client.price(_se.symbol))
+                except Exception as _exc: logger.warning("SCALPER STARTUP PRE-RECONCILE FAIL | %s | %s", _se.id, _exc)
             self.normalize_inherited_overleverage()
             if EMERGENCY_CLOSE_ALL_AND_RESET:
                 self.emergency_close_all_and_reset()
@@ -4962,6 +5745,13 @@ class Bot:
         for symbol in sorted(symbols):
             self.client.cancel_all_confirmed(symbol)
             logger.warning(f"EMERGENCY RESET | ordens canceladas e CONFIRMADAS | {symbol}")
+
+        for sst in state_scalper.values():
+            sst=sst or {}; pos=sst.get("position") or {}; leg=pos.get("leg") if isinstance(pos,dict) else None
+            if leg:
+                q=dec(leg.get("qty")); side=str(leg.get("side") or "").upper()
+                add_logical(str(sst.get("symbol")), side, str(sst.get("strategy")), q,
+                            pos.get("tp_price") or "-", pos.get("stop_price") or "-", 0, leg.get("entry_price") or "-")
 
         for p in (positions if isinstance(positions, list) else []):
             qty = abs(dec(p.get("positionAmt")))
@@ -5059,6 +5849,14 @@ class Bot:
             except Exception as ex:
                 close_errors = True
                 logger.exception(f"HARD KILL pyramid {e.id} | {ex}")
+        for e in self.scalper_engines:
+            try:
+                st=e.st(); p=self.md.get(e.symbol) or fallback_price.get(e.symbol)
+                if st.get("position"):
+                    if not p or p<=0: raise RuntimeError("preco de referencia indisponivel para fechar SCALPER em HARD_KILL")
+                    if not e._close_market(p, "HARD_KILL"): raise RuntimeError("close scalper nao confirmado")
+            except Exception as ex:
+                close_errors=True; logger.exception(f"HARD KILL scalper {e.id} | {ex}")
 
         remaining: List[Dict[str, Any]] = []
         for _ in range(5):
@@ -5102,6 +5900,9 @@ class Bot:
             for e in self.pyramid_engines:
                 p = e.st()
                 parts.append(f"P:{p['symbol']}:{p['side']}:{p.get('grid_id','LEGACY')}:eq={p['equity']},lvl={p['next_level']},legs={len(p.get('legs',[]) or [])},net={p.get('last_net_pnl','0')},stop={int(bool(p.get('stopped')))},phase={p.get('grid_phase','0')}")
+            for e in self.scalper_engines:
+                q=e.st(); pos=q.get("position") or {}
+                parts.append(f"S:{q['symbol']}:eq={q['equity']},pos={pos.get('side','-')},trades={q.get('trades',0)},wins={q.get('wins',0)},losses={q.get('losses',0)},score={q.get('last_score','0')},stop={int(bool(q.get('stopped')))}")
             ks = self.store.state["kill_switch"]
             gate = self.store.state.get("trade_gate", {})
         logger.info(f"HEARTBEAT | wallet={self.account.wallet_balance} avail={self.account.available_balance} unreal={self.account.unrealized} | kill={ks.get('mode')}:{ks.get('reason')} | entry_gate={gate.get('open_allowed')}:{gate.get('reason')} | ledger={self.ledger.open_by_symbol_side()} | {' | '.join(parts)}")
@@ -5147,6 +5948,12 @@ class Bot:
                     logger.info(f"PYRAMID STATUS | {e.id} | {d}")
             except Exception as ex:
                 logger.warning(f"PYRAMID DIAGNOSTIC FAIL | {e.id} | {ex}")
+        for e in self.scalper_engines:
+            try:
+                d=e.diagnostic()
+                logger.info(f"SCALPER MONITOR | {e.id} | {d}")
+            except Exception as ex:
+                logger.warning(f"SCALPER DIAGNOSTIC FAIL | {e.id} | {ex}")
         with self.news._lock:
             news_events = len(self.news.events)
             news_source = self.news.last_source
@@ -5161,7 +5968,8 @@ class Bot:
             f"mode=HEDGE margin=ISOLATED multi_strategy_same_symbol={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} native_protection={NATIVE_PROTECTIVE_ORDERS} | "
             f"news={news_health} source={news_source} events={news_events} age_s={news_age} fail_closed={NEWS_FAIL_CLOSED} window=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | "
             f"range=False legacy_range_engines={len(self.range_engines)} | "
-            f"pyramid={PYRAMID_ENGINE_ENABLED} architecture=SINGLE bankroll_logico={PYRAMID_BANKROLL_USD} initial={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT} btc_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} lev={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} native_risk_stop={PYRAMID_NATIVE_RISK_STOP}"
+            f"pyramid={PYRAMID_ENGINE_ENABLED} architecture=SINGLE bankroll_logico={PYRAMID_BANKROLL_USD} initial={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT} btc_add_floor={PYRAMID_BTC_MIN_ADD_NOTIONAL_USD} lev={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} native_risk_stop={PYRAMID_NATIVE_RISK_STOP} | "
+            f"scalper={SCALPER_ENGINE_ENABLED} bankroll={SCALPER_BANKROLL_USD}/BTC={BTC_SCALPER_BANKROLL_USD} maker_entry=GTX analysis=BOOK+TAPE+MICROPRICE target={SCALPER_MIN_TARGET_PCT}..{SCALPER_MAX_TARGET_PCT} stop={SCALPER_MIN_STOP_PCT}..{SCALPER_MAX_STOP_PCT} max_loss={SCALPER_MAX_LOSS_USD} recovery={SCALPER_RECOVERY_MULTIPLIERS} compound={SCALPER_COMPOUND_ENABLED}/{SCALPER_COMPOUND_PROFIT_SHARE}/max{SCALPER_COMPOUND_MAX_MULTIPLIER} liquidity_entry={SCALPER_MAX_BOOK_PARTICIPATION} liquidity_exit={SCALPER_EXIT_CHUNK_BOOK_PARTICIPATION}"
         )
         if LIVE_TRADING:
             try:
@@ -5177,6 +5985,7 @@ class Bot:
             state_pyramid = {}
             state_pyramid.update(self.store.state.get("pyramid", {}))
             state_pyramid.update(self.store.state.get("pyramid_grids", {}))
+            state_scalper = dict(self.store.state.get("scalper", {}))
             legacy_owners = dict(self.store.state.get("symbol_owner", {}))
 
         logical: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
@@ -5284,11 +6093,12 @@ class Bot:
                 except Exception:
                     x_recovery = 0
                 is_pyramid = str(x.get("strategy", "")).startswith("PYRAMID:")
-                x_multiplier = D(1) if is_pyramid else RECOVERY_MULTIPLIER ** x_recovery
-                x_base_notional = PYRAMID_INITIAL_NOTIONAL_USD if is_pyramid else configured_initial_notional(symbol)
+                is_scalper = str(x.get("strategy", "")).startswith("SCALPER:")
+                x_multiplier = D(1) if (is_pyramid or is_scalper) else RECOVERY_MULTIPLIER ** x_recovery
+                x_base_notional = PYRAMID_INITIAL_NOTIONAL_USD if is_pyramid else (configured_scalper_initial_notional(symbol) if is_scalper else configured_initial_notional(symbol))
                 x_notional = x_qty * mark if mark > 0 else D(0)
-                x_mode = "PYRAMID" if is_pyramid else ("NORMAL" if x_recovery == 0 else "RECOVERY")
-                if is_pyramid:
+                x_mode = "PYRAMID" if is_pyramid else ("SCALPER" if is_scalper else ("NORMAL" if x_recovery == 0 else "RECOVERY"))
+                if is_pyramid or is_scalper:
                     x_recovery = 0
                 virtual_lot_parts.append(
                     f"{x['strategy']}:{side}"
@@ -5338,11 +6148,12 @@ class Bot:
                 except Exception:
                     x_recovery = 0
                 is_pyramid = str(x.get("strategy", "")).startswith("PYRAMID:")
-                x_multiplier = D(1) if is_pyramid else RECOVERY_MULTIPLIER ** x_recovery
-                x_base_notional = PYRAMID_INITIAL_NOTIONAL_USD if is_pyramid else configured_initial_notional(symbol)
+                is_scalper = str(x.get("strategy", "")).startswith("SCALPER:")
+                x_multiplier = D(1) if (is_pyramid or is_scalper) else RECOVERY_MULTIPLIER ** x_recovery
+                x_base_notional = PYRAMID_INITIAL_NOTIONAL_USD if is_pyramid else (configured_scalper_initial_notional(symbol) if is_scalper else configured_initial_notional(symbol))
                 x_notional = x_qty * mark if mark > 0 else D(0)
-                x_mode = "PYRAMID" if is_pyramid else ("NORMAL" if x_recovery == 0 else "RECOVERY")
-                if is_pyramid:
+                x_mode = "PYRAMID" if is_pyramid else ("SCALPER" if is_scalper else ("NORMAL" if x_recovery == 0 else "RECOVERY"))
+                if is_pyramid or is_scalper:
                     x_recovery = 0
                 logger.warning(
                     f"VIRTUAL STRATEGY | strategy={x.get('strategy')} | symbol={symbol} side={side} | qty={dstr(x_qty, 8)} | notional_usd={dstr(x_notional, 8)} | "
@@ -5367,6 +6178,12 @@ class Bot:
                     else:
                         logger.critical("HARD KILL permanece HARD | zero exposicao nao confirmado")
                 prices = {s: self.md.get(s) for s in SYMBOLS}
+
+                # Native SCALPER stops may fill between loops. Consume them before reconciliation
+                # so a legitimate exchange-side stop cannot create a transient ledger mismatch.
+                for _se in self.scalper_engines:
+                    try: _se.pre_reconcile(prices.get(_se.symbol))
+                    except Exception as _exc: logger.warning("SCALPER PRE-RECONCILE FAIL | %s | %s", _se.id, _exc)
 
                 _now_reconcile = now_ms()
                 if _now_reconcile - self._last_periodic_reconcile_ms >= int(RECONCILE_INTERVAL_SECONDS * 1000):
@@ -5393,6 +6210,11 @@ class Bot:
                     if p and p > 0:
                         try: e.tick(p)
                         except Exception as ex: logger.exception(f"PYRAMID TICK FAIL | {e.id} | {ex}")
+                for e in self.scalper_engines:
+                    p = prices.get(e.symbol)
+                    if p and p > 0:
+                        try: e.tick(p)
+                        except Exception as ex: logger.exception(f"SCALPER TICK FAIL | {e.id} | {ex}")
                 self.heartbeat()
             except KeyboardInterrupt:
                 break
