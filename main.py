@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.27.4-v59.4-bankroll-reset-fix"
+VERSION = "8.27.5-v59.5-bankroll-runtime-retry"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -5229,6 +5229,98 @@ class Bot:
                 and str(rec.get("id") or "") == BROKEN_BANKROLL_RESET_ID
             )
 
+    def _pending_bankroll_reset_has_flat_candidate(self) -> bool:
+        """Return True only when a previously pending reset candidate is now provably flat.
+
+        This is intentionally a cheap readiness gate. The actual reset routine performs
+        the authoritative safety checks again before mutating logical bankroll state.
+        """
+        if not RESET_BROKEN_BANKROLLS_ON_STARTUP or not LIVE_TRADING:
+            return False
+        if self._broken_bankroll_reset_completed():
+            return False
+
+        with self.store.lock:
+            maintenance = self.store.state.get("maintenance", {}) or {}
+            rec = maintenance.get("broken_bankroll_reset", {}) or {}
+            if not isinstance(rec, dict) or str(rec.get("id") or "") != BROKEN_BANKROLL_RESET_ID:
+                return False
+            pending_ids = [
+                str(x.get("strategy") or "")
+                for x in (rec.get("skipped_strategies") or [])
+                if isinstance(x, dict) and x.get("reason") == "EXPOSURE_STILL_OPEN"
+            ]
+            if not pending_ids:
+                # Incomplete marker without pending exposure: let the authoritative
+                # routine finalize the one-shot migration.
+                return not bool(rec.get("completed"))
+
+            pyramid_states = []
+            for bucket in ("pyramid", "pyramid_grids"):
+                pyramid_states.extend(
+                    st for st in self.store.state.get(bucket, {}).values()
+                    if isinstance(st, dict)
+                )
+            scalper_states = [
+                st for st in self.store.state.get("scalper", {}).values()
+                if isinstance(st, dict)
+            ]
+
+        for strategy_id in pending_ids:
+            st = None
+            if strategy_id.startswith("PYRAMID:"):
+                st = next(
+                    (x for x in pyramid_states if str(x.get("strategy") or "") == strategy_id),
+                    None,
+                )
+                if st is None:
+                    # State disappeared after a confirmed reconcile: allow the full
+                    # reset routine to resolve/finalize the marker conservatively.
+                    return True
+                symbol = str(st.get("symbol") or "").upper()
+                side = str(st.get("side") or "").upper()
+                state_qty = sum(
+                    (dec(x.get("qty")) for x in (st.get("legs") or []) if isinstance(x, dict)),
+                    D(0),
+                )
+                ledger_qty = (
+                    self.ledger.open_strategy_qty(strategy_id, symbol, side)
+                    if symbol and side else D(0)
+                )
+                if state_qty <= 0 and ledger_qty <= 0 and not st.get("native_risk_stop"):
+                    return True
+
+            elif strategy_id.startswith("SCALPER:"):
+                st = next(
+                    (x for x in scalper_states if str(x.get("strategy") or "") == strategy_id),
+                    None,
+                )
+                if st is None:
+                    return True
+                symbol = str(st.get("symbol") or "").upper()
+                pos = st.get("position") or {}
+                leg = pos.get("leg") if isinstance(pos, dict) else None
+                state_qty = dec((leg or {}).get("qty")) if isinstance(leg, dict) else D(0)
+                side = str((leg or {}).get("side") or "").upper() if isinstance(leg, dict) else ""
+                ledger_qty = (
+                    self.ledger.open_strategy_qty(strategy_id, symbol, side)
+                    if symbol and side else D(0)
+                )
+                if state_qty <= 0 and ledger_qty <= 0 and not st.get("native_risk_stop"):
+                    return True
+
+        return False
+
+    def retry_pending_bankroll_reset_after_reconcile(self) -> None:
+        """Finish the one-shot reset as soon as an old pending exposure becomes flat."""
+        if not self._pending_bankroll_reset_has_flat_candidate():
+            return
+        logger.warning(
+            "BANKROLL RESET RETRY | id=%s | candidato_pendente_agora_flat=True",
+            BROKEN_BANKROLL_RESET_ID,
+        )
+        self.reset_broken_bankrolls_to_initial()
+
     @staticmethod
     def _loss_stop_reason_allows_bankroll_reset(strategy_kind: str, stop_reason: Any) -> bool:
         reason = str(stop_reason or "").upper()
@@ -5251,7 +5343,7 @@ class Bot:
           - a strategy stopped specifically by its own loss budget.
 
         Safety properties:
-          - requires LIVE_TRADING and successful startup reconciliation before this call;
+          - requires LIVE_TRADING and a successful reconciliation before every call;
           - never touches exchange orders/positions or the durable fill ledger;
           - never resets a strategy with state/ledger/native-stop exposure;
           - never clears operational/protection stops unrelated to bankroll loss;
@@ -5849,7 +5941,7 @@ class Bot:
         logger.info(f"SYMBOLS={SYMBOLS} | RANGE=False | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} | SCALPER={SCALPER_ENGINE_ENABLED} analysis=BOOK+TAPE+MICROPRICE")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
         logger.info(f"PYRAMID CAPITAL | bankroll_logico={PYRAMID_BANKROLL_USD} initial_notional={PYRAMID_INITIAL_NOTIONAL_USD} add_base=REAL_FREE_MARGIN add_pct={PYRAMID_ADD_FREE_MARGIN_PCT}")
-        logger.info(f"BANKROLL RESET | enabled={RESET_BROKEN_BANKROLLS_ON_STARTUP} id={BROKEN_BANKROLL_RESET_ID} mode=ONE_SHOT_FLAT_NEGATIVE_REALIZED_OR_LOSS_STOPPED")
+        logger.info(f"BANKROLL RESET | enabled={RESET_BROKEN_BANKROLLS_ON_STARTUP} id={BROKEN_BANKROLL_RESET_ID} mode=ONE_SHOT_SAFE_RETRY_UNTIL_FLAT")
         logger.info(f"PYRAMID RISK | step={PYRAMID_STEP_PCT} target_leverage={PYRAMID_LEVERAGE}x effective_leverage_cap={PYRAMID_MAX_EFFECTIVE_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD} fee_model_taker={TAKER_FEE_RATE} | pre_v56_one_shot_retire={RETIRE_PRE_V56_PYRAMID_ON_STARTUP} | legacy_overleverage_flag={NORMALIZE_INHERITED_OVERLEVERAGE_ON_STARTUP}")
         logger.info(f"SCALPER CAPITAL | bankroll BTC={BTC_SCALPER_BANKROLL_USD} ETH/HYPE={SCALPER_BANKROLL_USD} | notional BTC={BTC_SCALPER_INITIAL_NOTIONAL_USD} ETH/HYPE={SCALPER_INITIAL_NOTIONAL_USD} | lev={SCALPER_LEVERAGE}x")
         logger.info(f"SCALPER SIGNAL | spread_max={SCALPER_MAX_SPREAD_PCT} range5={SCALPER_MIN_RANGE_PCT}..{SCALPER_MAX_RANGE_PCT} score={SCALPER_SCORE_THRESHOLD} depth_min={SCALPER_MIN_DEPTH_IMBALANCE} tape_min={SCALPER_MIN_TAPE_IMBALANCE} confirm={SCALPER_SIGNAL_CONFIRM_SECONDS}s")
@@ -6120,7 +6212,8 @@ class Bot:
             # Heartbeat therefore reports only active/drain-only PYRAMID engines.
             for e in self.pyramid_engines:
                 p = e.st()
-                parts.append(f"P:{p['symbol']}:{p['side']}:{p.get('grid_id','LEGACY')}:eq={p['equity']},lvl={p['next_level']},legs={len(p.get('legs',[]) or [])},net={p.get('last_net_pnl','0')},stop={int(bool(p.get('stopped')))},phase={p.get('grid_phase','0')}")
+                grid_label = "SINGLE" if str(p.get("grid_id") or "LEGACY").upper() == "LEGACY" else str(p.get("grid_id"))
+                parts.append(f"P:{p['symbol']}:{p['side']}:{grid_label}:eq={p['equity']},lvl={p['next_level']},legs={len(p.get('legs',[]) or [])},net={p.get('last_net_pnl','0')},stop={int(bool(p.get('stopped')))},phase={p.get('grid_phase','0')}")
             for e in self.scalper_engines:
                 q=e.st(); pos=q.get("position") or {}
                 parts.append(f"S:{q['symbol']}:eq={q['equity']},pos={pos.get('side','-')},trades={q.get('trades',0)},wins={q.get('wins',0)},losses={q.get('losses',0)},score={q.get('last_score','0')},stop={int(bool(q.get('stopped')))}")
@@ -6490,6 +6583,10 @@ class Bot:
                     self._last_periodic_reconcile_ms = _now_reconcile
                     try:
                         self.reconciler.reconcile()
+                        # V59.5: a one-shot bankroll reset that was blocked by an old
+                        # live exposure now completes automatically once reconciliation
+                        # proves that at least one pending strategy became flat.
+                        self.retry_pending_bankroll_reset_after_reconcile()
                     except Exception as _re:
                         reason = f"RECONCILE_UNAVAILABLE:{type(_re).__name__}:{_re}"
                         with self.store.lock:
