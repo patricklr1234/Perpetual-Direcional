@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.28.0-v60-capital-efficient-margin"
+VERSION = "8.28.1-v61-exact-decimal-ledger"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -1900,10 +1900,13 @@ class FillLedger:
         return len(rows)
 
     def open_strategy_qty(self, strategy_id: str, symbol: str, side: str) -> Decimal:
+        """Exact Decimal sum; never aggregate durable quantities through SQLite REAL."""
         with self.lock:
-            row = self.db.execute("SELECT COALESCE(SUM(CAST(open_qty AS REAL)),0) FROM lots WHERE strategy_id=? AND symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0",
-                                  (strategy_id, symbol, side)).fetchone()
-        return dec(row[0] if row else 0)
+            rows = self.db.execute(
+                "SELECT open_qty FROM lots WHERE strategy_id=? AND symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0",
+                (strategy_id, symbol, side),
+            ).fetchall()
+        return sum((dec(row[0]) for row in rows), D(0))
 
     def open_lots_by_strategy_prefix(self, prefix: str) -> List[Dict[str, Any]]:
         """Return durable open lots owned by strategies whose id starts with prefix."""
@@ -1943,12 +1946,13 @@ class FillLedger:
         return removed
 
     def open_non_range_qty(self, symbol: str, side: str) -> Decimal:
+        """Exact Decimal non-RANGE ownership total."""
         with self.lock:
-            row = self.db.execute(
-                "SELECT COALESCE(SUM(CAST(open_qty AS REAL)),0) FROM lots WHERE symbol=? AND position_side=? AND strategy_id NOT LIKE 'RANGE:%' AND CAST(open_qty AS REAL)>0",
+            rows = self.db.execute(
+                "SELECT open_qty FROM lots WHERE symbol=? AND position_side=? AND strategy_id NOT LIKE 'RANGE:%' AND CAST(open_qty AS REAL)>0",
                 (symbol, side),
-            ).fetchone()
-        return dec(row[0] if row else 0)
+            ).fetchall()
+        return sum((dec(row[0]) for row in rows), D(0))
 
     def order_owner(self, client_id: str) -> Optional[str]:
         with self.lock:
