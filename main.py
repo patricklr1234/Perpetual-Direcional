@@ -1788,7 +1788,7 @@ def audit_extract_open_orders_and_positions(
         return result
     
     snap = reconciler.last_snapshot
-    result["timestamp_ms"] = snap.timestamp_ms
+    result["timestamp_ms"] = snap.captured_ms
     
     # Physical positions (nonzero only)
     for (sym, side), qty in snap.positions.items():
