@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.29.0-v63-pyramid-directional-lock-breakeven"
+VERSION = "8.30.0-v64-flat-recovery-auto-release"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -5671,6 +5671,134 @@ class Bot:
         )
         self.reset_broken_bankrolls_to_initial()
 
+    def release_exchange_flat_recovery_blocks(self) -> None:
+        """One-shot-safe release of stale EXCHANGE_FLAT_RECOVERY_UNACCOUNTED states.
+
+        A strategy is released only after proving, for its exact symbol/side, that:
+          - exchange position quantity is zero;
+          - exchange has no open order on that Hedge-Mode side;
+          - durable ledger ownership quantity is zero;
+          - persistent state has no logical legs/native protective stop.
+
+        The release resets the logical bankroll/recovery state to the configured initial
+        bankroll and removes only blocks whose reason is the stale exchange-flat marker.
+        It never cancels orders, closes positions, or mutates the durable fill ledger.
+        """
+        if not LIVE_TRADING:
+            return
+
+        marker = "EXCHANGE_FLAT_RECOVERY_UNACCOUNTED"
+        released: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+
+        with self.store.lock:
+            candidates: List[Tuple[str, Dict[str, Any]]] = []
+            for bucket in ("pyramid", "pyramid_grids"):
+                for key, st in self.store.state.get(bucket, {}).items():
+                    if not isinstance(st, dict):
+                        continue
+                    if str(st.get("stop_reason") or "").upper() != marker:
+                        continue
+                    sid = str(st.get("strategy") or f"PYRAMID:{key}")
+                    candidates.append((sid, st))
+
+        for strategy_id, st in candidates:
+            symbol = str(st.get("symbol") or "").upper()
+            side = str(st.get("side") or "").upper()
+            if not symbol or side not in ("LONG", "SHORT"):
+                skipped.append({"strategy": strategy_id, "reason": "INVALID_SYMBOL_SIDE"})
+                continue
+
+            try:
+                rows = self.client.positions(symbol)
+                if not isinstance(rows, list):
+                    raise RuntimeError(f"positionRisk indeterminado: {rows!r}")
+                physical_qty = D(0)
+                for row in rows:
+                    if (str(row.get("symbol") or "").upper() == symbol and
+                            str(row.get("positionSide") or "").upper() == side):
+                        physical_qty = abs(dec(row.get("positionAmt")))
+                        break
+
+                orders = self.client.open_orders(symbol)
+                if not isinstance(orders, list):
+                    raise RuntimeError(f"openOrders indeterminado: {orders!r}")
+                side_orders = [o for o in orders if str(o.get("positionSide") or "").upper() == side]
+
+                with self.store.lock:
+                    state_qty = sum((dec(x.get("qty")) for x in (st.get("legs") or []) if isinstance(x, dict)), D(0))
+                    native = st.get("native_risk_stop")
+                ledger_qty = self.ledger.open_strategy_qty(strategy_id, symbol, side)
+
+                if physical_qty > 0 or side_orders or state_qty > 0 or ledger_qty > 0 or native:
+                    skipped.append({
+                        "strategy": strategy_id, "reason": "NOT_PROVABLY_FLAT",
+                        "physical_qty": str(physical_qty), "open_orders": len(side_orders),
+                        "state_qty": str(state_qty), "ledger_qty": str(ledger_qty),
+                        "native_stop": bool(native),
+                    })
+                    continue
+
+                with self.store.lock:
+                    share = dec(st.get("capital_share", "1"))
+                    bankroll = PYRAMID_BANKROLL_USD * share
+                    previous = {
+                        "equity": str(st.get("equity", "0")),
+                        "realized_pnl": str(st.get("realized_pnl", "0")),
+                        "stop_reason": str(st.get("stop_reason") or ""),
+                    }
+                    st["bankroll"] = str(bankroll)
+                    st["equity"] = str(bankroll)
+                    st["realized_pnl"] = "0"
+                    st["last_unrealized"] = "0"
+                    st["last_net_pnl"] = "0"
+                    st["stopped"] = False
+                    st["stop_reason"] = None
+                    st["anchor"] = None
+                    st["next_level"] = 1
+                    st["levels_filled"] = 0
+                    st["last_trigger_price"] = None
+                    st["native_risk_stop"] = None
+                    st["return_exit_armed"] = False
+                    st["return_exit_reference"] = None
+                    st["last_directional_exit_reason"] = None
+                    st["last_update"] = now_iso()
+                    self.store.save()
+
+                # Remove only stale-marker blocks for this strategy; unrelated safety
+                # blocks remain untouched.
+                with self.store.lock:
+                    op_reason = str((self.store.state.get("operational_blocks", {}) or {}).get(strategy_id) or "")
+                    pr_reason = str((self.store.state.get("protection_blocks", {}) or {}).get(strategy_id) or "")
+                if marker in op_reason.upper():
+                    self.store.set_operational_block(strategy_id, None)
+                if marker in pr_reason.upper():
+                    self.store.set_protection_block(strategy_id, None)
+
+                released.append({"strategy": strategy_id, "bankroll": str(bankroll), "previous": previous})
+                logger.warning(
+                    "EXCHANGE FLAT RECOVERY RELEASE | strategy=%s | flat=CONFIRMED | bankroll=%s | previous=%s",
+                    strategy_id, bankroll, previous,
+                )
+            except Exception as exc:
+                skipped.append({"strategy": strategy_id, "reason": f"VERIFY_FAILED:{exc}"})
+                logger.exception("EXCHANGE FLAT RECOVERY RELEASE | SKIP FAIL-CLOSED | %s", strategy_id)
+
+        with self.store.lock:
+            maintenance = self.store.state.setdefault("maintenance", {})
+            maintenance["exchange_flat_auto_release_v64"] = {
+                "at": now_iso(),
+                "released": released,
+                "skipped": skipped,
+                "policy": "PROVABLY_FLAT_ONLY; NO_ORDER_CANCEL; NO_POSITION_CLOSE; NO_LEDGER_MUTATION",
+            }
+            self.store.save()
+
+        logger.warning(
+            "EXCHANGE FLAT RECOVERY RELEASE COMPLETE | released=%s skipped=%s",
+            len(released), len(skipped),
+        )
+
     @staticmethod
     def _loss_stop_reason_allows_bankroll_reset(strategy_kind: str, stop_reason: Any) -> bool:
         reason = str(stop_reason or "").upper()
@@ -6334,6 +6462,9 @@ class Bot:
             if EMERGENCY_CLOSE_ALL_AND_RESET:
                 self.emergency_close_all_and_reset()
             self.reconciler.reconcile()
+            # Release stale exchange-flat recovery stops only after reconciliation and
+            # an independent per-side proof that exchange/state/ledger/orders are flat.
+            self.release_exchange_flat_recovery_blocks()
             # User-requested one-shot reset of bankrolls that already broke. This runs
             # only after ledger/state/physical reconciliation has succeeded.
             self.reset_broken_bankrolls_to_initial()
