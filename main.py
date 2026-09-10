@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.28.1-v62-open-orders-audit"
+VERSION = "8.29.0-v63-pyramid-directional-lock-breakeven"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -171,6 +171,17 @@ RETIRE_LEGACY_RANGE_ON_STARTUP = os.getenv("RETIRE_LEGACY_RANGE_ON_STARTUP", "1"
 PYRAMID_BANKROLL_USD = D(os.getenv("PYRAMID_BANKROLL_USD", "10"))
 PYRAMID_INITIAL_NOTIONAL_USD = D(os.getenv("PYRAMID_INITIAL_NOTIONAL_USD", "100"))
 PYRAMID_STEP_PCT = D(os.getenv("PYRAMID_STEP_PCT", "0.01"))
+
+# PYRAMID: apenas uma direção por símbolo. Após +1% favorável, a proteção
+# nativa sobe/desce para o preço médio de entrada (breakeven bruto). Se o preço
+# retornar à entrada, encerra a cesta. Com -1% adverso, encerra a cesta; uma
+# eventual entrada inversa só poderá ocorrer depois de o lado anterior ficar
+# fisicamente flat e pelo gatilho normal da estratégia.
+PYRAMID_DIRECTIONAL_LOCK_ENABLED = os.getenv("PYRAMID_DIRECTIONAL_LOCK_ENABLED", "1") == "1"
+PYRAMID_RETURN_EXIT_ARM_PCT = D(os.getenv("PYRAMID_RETURN_EXIT_ARM_PCT", "0.01"))
+PYRAMID_ADVERSE_REVERSAL_PCT = D(os.getenv("PYRAMID_ADVERSE_REVERSAL_PCT", "0.01"))
+PYRAMID_BREAKEVEN_STOP_ENABLED = os.getenv("PYRAMID_BREAKEVEN_STOP_ENABLED", "1") == "1"
+
 # The Directional robot is independent. Pyramid keeps its own operational anchor;
 # it does not try to complete or coordinate the RANGE grid of another account.
 PYRAMID_GRID_PHASES = tuple(
@@ -341,6 +352,8 @@ def validate_runtime_config() -> None:
         require(value > 0, f"{name} deve ser >0, atual={value}")
 
     require(D(0) < PYRAMID_STEP_PCT < D(1), f"PYRAMID_STEP_PCT deve estar em (0,1), atual={PYRAMID_STEP_PCT}")
+    require(D(0) < PYRAMID_RETURN_EXIT_ARM_PCT < D(1), f"PYRAMID_RETURN_EXIT_ARM_PCT deve estar em (0,1), atual={PYRAMID_RETURN_EXIT_ARM_PCT}")
+    require(D(0) < PYRAMID_ADVERSE_REVERSAL_PCT < D(1), f"PYRAMID_ADVERSE_REVERSAL_PCT deve estar em (0,1), atual={PYRAMID_ADVERSE_REVERSAL_PCT}")
     require(D(0) < PYRAMID_ADD_FREE_MARGIN_PCT <= D(1), f"PYRAMID_ADD_FREE_MARGIN_PCT deve estar em (0,1], atual={PYRAMID_ADD_FREE_MARGIN_PCT}")
     require(PYRAMID_MAX_LEVELS_PER_TICK >= 1, f"PYRAMID_MAX_LEVELS_PER_TICK deve ser >=1, atual={PYRAMID_MAX_LEVELS_PER_TICK}")
     require(PYRAMID_NATIVE_STOP_REFRESH_SECONDS > 0, f"PYRAMID_NATIVE_STOP_REFRESH_SECONDS deve ser >0, atual={PYRAMID_NATIVE_STOP_REFRESH_SECONDS}")
@@ -3991,8 +4004,12 @@ class PyramidEngine:
       - bankroll/equity virtual permanece para PnL e limite de perda, mas não
         aumenta sozinho o tamanho das novas adições.
     As regras da exchange arredondam para step/min-notional quando necessário.
-    Recuos nunca reduzem posição. O encerramento automático permanece pelo
-    limite explícito PYRAMID_MAX_LOSS_USD.
+    Directional Lock impede novas exposições PYRAMID LONG+SHORT simultâneas
+    no mesmo símbolo. Após +1% favorável, arma retorno à entrada e move a
+    proteção nativa para o preço médio de entrada; após retorno à entrada ou
+    -1% adverso, encerra a cesta. A direção inversa só pode voltar a entrar
+    depois de flat e pelo gatilho normal. PYRAMID_MAX_LOSS_USD permanece como
+    proteção adicional.
     """
     def __init__(self, symbol: str, side: str, client: AsterClient, md: MarketData,
                  news: NewsFilter, account: AccountManager, exe: ExecutionEngine, store: StateStore,
@@ -4012,7 +4029,159 @@ class PyramidEngine:
         self._last_native_stop_refresh = 0.0
 
     def st(self) -> Dict[str, Any]:
-        return self.store.state[self.state_bucket][self.state_key]
+        st = self.store.state[self.state_bucket][self.state_key]
+        st.setdefault("return_exit_armed", False)
+        st.setdefault("return_exit_reference", None)
+        st.setdefault("last_directional_exit_reason", None)
+        return st
+
+    def _opposite_side(self) -> str:
+        return "SHORT" if self.side == "LONG" else "LONG"
+
+    def _opposite_state(self) -> Optional[Dict[str, Any]]:
+        key = f"{self.symbol}:{self._opposite_side()}"
+        other = self.store.state.get(self.state_bucket, {}).get(key)
+        return other if isinstance(other, dict) else None
+
+    @staticmethod
+    def _state_open_qty(st: Optional[Dict[str, Any]]) -> Decimal:
+        if not isinstance(st, dict):
+            return D(0)
+        return sum((max(D(0), dec(x.get("qty"))) for x in (st.get("legs") or [])), D(0))
+
+    def _opposite_physical_active(self) -> bool:
+        if not LIVE_TRADING:
+            return self._state_open_qty(self._opposite_state()) > 0
+        try:
+            rows = self.client.positions(self.symbol)
+            if not isinstance(rows, list):
+                rows = [rows] if rows else []
+            for p in rows:
+                if (
+                    str(p.get("symbol", "")).upper() == self.symbol
+                    and str(p.get("positionSide", "")).upper() == self._opposite_side()
+                    and abs(dec(p.get("positionAmt"))) > 0
+                ):
+                    return True
+            return False
+        except Exception as exc:
+            logger.error(
+                "PYRAMID DIRECTION LOCK VERIFY FAIL | %s | opposite=%s | %s",
+                self.id, self._opposite_side(), exc,
+            )
+            return True  # fail-closed: não abre lado oposto sem conseguir provar flat.
+
+    def _opposite_active(self) -> bool:
+        if not PYRAMID_DIRECTIONAL_LOCK_ENABLED:
+            return False
+        return (
+            self._state_open_qty(self._opposite_state()) > 0
+            or self._opposite_physical_active()
+        )
+
+    def _weighted_entry_price(self) -> Decimal:
+        qty = D(0)
+        value = D(0)
+        for leg in list(self.st().get("legs") or []):
+            q = max(D(0), dec(leg.get("qty")))
+            ep = dec(leg.get("entry_price"))
+            if q > 0 and ep > 0:
+                qty += q
+                value += q * ep
+        return (value / qty) if qty > 0 else D(0)
+
+    def _directional_move_pct(self, price: Decimal, entry: Decimal) -> Tuple[Decimal, Decimal]:
+        if price <= 0 or entry <= 0:
+            return D(0), D(0)
+        raw = (price / entry) - D(1)
+        favorable = raw if self.side == "LONG" else -raw
+        return favorable, -favorable
+
+    def _directional_close(self, price: Decimal, reason: str) -> bool:
+        st = self.st()
+        legs = list(st.get("legs") or [])
+        if not legs:
+            return True
+
+        self._clear_native_risk_stop()
+        total, closes = self.exe.close_legs(self.id, self.symbol, legs, price, reason)
+        closed_ids = {str(c.get("leg_id")) for c in closes}
+        remaining = [leg for leg in legs if str(leg.get("id")) not in closed_ids]
+
+        st["realized_pnl"] = str(dec(st.get("realized_pnl")) + total)
+        share = dec(st.get("capital_share", "1"))
+        st["equity"] = str(PYRAMID_BANKROLL_USD * share + dec(st.get("realized_pnl")))
+        st["last_unrealized"] = "0"
+        st["last_net_pnl"] = str(total)
+        st["legs"] = remaining
+        st["native_risk_stop"] = None
+        st["return_exit_armed"] = False
+        st["return_exit_reference"] = None
+        st["last_directional_exit_reason"] = reason
+        st["last_update"] = now_iso()
+
+        if remaining:
+            self.store.set_operational_block(
+                self.id, f"PYRAMID_DIRECTIONAL_PARTIAL_EXIT_REMAINS:{reason}"
+            )
+            self.store.save()
+            logger.critical(
+                "PYRAMID DIRECTIONAL PARTIAL EXIT | %s | reason=%s remaining_legs=%s",
+                self.id, reason, len(remaining),
+            )
+            self._ensure_native_risk_stop(price, force=True)
+            return False
+
+        st["stopped"] = False
+        st["stop_reason"] = None
+        st["anchor"] = str(price)
+        st["next_level"] = 1
+        st["levels_filled"] = 0
+        st["last_trigger_price"] = None
+        self.store.save()
+        logger.warning(
+            "PYRAMID DIRECTIONAL EXIT | %s | reason=%s realized=%s new_anchor=%s",
+            self.id, reason, total, price,
+        )
+        return True
+
+    def _directional_exit_check(self, price: Decimal) -> bool:
+        if not PYRAMID_DIRECTIONAL_LOCK_ENABLED:
+            return False
+        st = self.st()
+        if not (st.get("legs") or []):
+            return False
+
+        entry = self._weighted_entry_price()
+        if entry <= 0:
+            return False
+        favorable, adverse = self._directional_move_pct(price, entry)
+
+        if not bool(st.get("return_exit_armed")) and favorable >= PYRAMID_RETURN_EXIT_ARM_PCT:
+            st["return_exit_armed"] = True
+            st["return_exit_reference"] = str(entry)
+            st["last_update"] = now_iso()
+            self.store.save()
+            logger.warning(
+                "PYRAMID RETURN/BREAKEVEN ARMED | %s | entry=%s mark=%s favorable=%s%% arm=%s%%",
+                self.id, entry, price, favorable * D(100), PYRAMID_RETURN_EXIT_ARM_PCT * D(100),
+            )
+            # Reinstala imediatamente a proteção nativa; _effective_native_stop_price
+            # passa a considerar o preço médio de entrada como breakeven.
+            if PYRAMID_BREAKEVEN_STOP_ENABLED:
+                self._ensure_native_risk_stop(price, force=True)
+
+        if bool(st.get("return_exit_armed")):
+            returned = price <= entry if self.side == "LONG" else price >= entry
+            if returned:
+                self._directional_close(price, "PYRAMID_RETURN_TO_ENTRY_AFTER_1PCT")
+                return True
+
+        if adverse >= PYRAMID_ADVERSE_REVERSAL_PCT:
+            self._directional_close(price, "PYRAMID_ADVERSE_1PCT_REVERSAL_EXIT")
+            return True
+
+        return False
 
     def _trigger_price(self, anchor: Decimal, level: int) -> Decimal:
         if self.side == "LONG":
@@ -4182,9 +4351,19 @@ class PyramidEngine:
                 raw = liq * (D(1) - LIQUIDATION_BUFFER_PCT)
                 liq_guard = self.exe.rules.trigger_price(self.symbol, raw, "UP")
 
-        candidates = [x for x in (loss_stop, liq_guard) if x is not None and x > 0]
+        breakeven_stop = None
+        if PYRAMID_BREAKEVEN_STOP_ENABLED and bool(self.st().get("return_exit_armed")):
+            entry = self._weighted_entry_price()
+            if entry > 0:
+                direction = "DOWN" if self.side == "LONG" else "UP"
+                breakeven_stop = self.exe.rules.trigger_price(self.symbol, entry, direction)
+
+        candidates = [x for x in (loss_stop, liq_guard, breakeven_stop) if x is not None and x > 0]
         if not candidates:
-            return None, {"loss_stop": loss_stop, "liq": liq, "liq_guard": liq_guard}
+            return None, {
+                "loss_stop": loss_stop, "liq": liq, "liq_guard": liq_guard,
+                "breakeven_stop": breakeven_stop,
+            }
 
         target = max(candidates) if self.side == "LONG" else min(candidates)
 
@@ -4196,6 +4375,7 @@ class PyramidEngine:
             "loss_stop": loss_stop,
             "liq": liq,
             "liq_guard": liq_guard,
+            "breakeven_stop": breakeven_stop,
             "target": target,
             "mark": mark,
             "valid": valid,
@@ -4371,6 +4551,12 @@ class PyramidEngine:
         return True
 
     def _open_level(self, price: Decimal, level: int, trigger: Decimal) -> bool:
+        if self._opposite_active():
+            logger.warning(
+                "PYRAMID DIRECTION LOCK | %s | bloqueando level=%s porque %s possui exposição/state ativo ou flat físico não pôde ser provado",
+                self.id, level, self._opposite_side(),
+            )
+            return False
         if not self._entry_allowed():
             return False
         sizing = self._sizing(price, level)
@@ -4497,6 +4683,18 @@ class PyramidEngine:
             if net <= -(PYRAMID_MAX_LOSS_USD * dec(st.get("capital_share", "1"))):
                 self._stop_and_close(price, net)
                 return
+
+            if self._directional_exit_check(price):
+                return
+
+            if self._opposite_active():
+                logger.warning(
+                    "PYRAMID EXISTING HEDGE LOCK | %s | opposite=%s ativo; sem novas adições até um lado ficar flat",
+                    self.id, self._opposite_side(),
+                )
+                return
+        elif self._opposite_active():
+            return
 
         anchor = dec(st.get("anchor"))
         level = max(1, int(st.get("next_level", 1)))
