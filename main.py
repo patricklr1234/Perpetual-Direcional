@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "8.28.1-v61-exact-decimal-ledger"
+VERSION = "8.28.1-v62-open-orders-audit"
 BOT_NAME = "ASTER_PERPETUAL_DIRECIONAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -1755,6 +1755,118 @@ class ExchangeSnapshot:
     positions: Dict[Tuple[str, str], Decimal]
     entry_prices: Dict[Tuple[str, str], Decimal]
     open_orders: List[Dict[str, Any]]
+
+
+# =============================================================================
+# OPEN ORDERS AUDIT EXTRACTOR (v62+)
+# =============================================================================
+# Read-only observability: extracts physical positions & active orders from
+# Reconciler.last_snapshot + FillLedger ownership mapping. No mutations,
+# no extra API calls. Deterministic JSON output for Watchdog coverage comparison.
+
+def audit_extract_open_orders_and_positions(
+    reconciler: "Reconciler",
+    ledger: "FillLedger",
+) -> Dict[str, Any]:
+    """Extract audit data: positions, active orders, and STOP_MARKET/TAKE_PROFIT coverage.
+    
+    Inputs:
+      - reconciler.last_snapshot: cached ExchangeSnapshot with positions & open_orders
+      - ledger.order_owner(cid): lookup strategy owner from FillLedger
+    
+    Output: dict with positions, orders, coverage aggregation, timestamp_ms.
+    Read-only; no order placement/cancellation/modification.
+    """
+    result: Dict[str, Any] = {
+        "positions": [],
+        "orders": [],
+        "coverage": {},
+        "timestamp_ms": 0,
+    }
+    
+    if not reconciler.last_snapshot:
+        return result
+    
+    snap = reconciler.last_snapshot
+    result["timestamp_ms"] = snap.timestamp_ms
+    
+    # Physical positions (nonzero only)
+    for (sym, side), qty in snap.positions.items():
+        if qty > 0:
+            result["positions"].append({
+                "symbol": sym,
+                "positionSide": side,
+                "physicalQty": str(qty),
+            })
+    
+    coverage_agg: Dict[Tuple[str, str], Dict[str, Decimal]] = {}
+    
+    if isinstance(snap.open_orders, list):
+        for o in snap.open_orders:
+            status = str(o.get("status", "")).upper()
+            if status not in ("NEW", "PARTIALLY_FILLED"):
+                continue
+            
+            cid = str(o.get("clientOrderId") or o.get("origClientOrderId") or "")
+            order_owner = ledger.order_owner(cid) if cid else None
+            
+            sym = str(o.get("symbol", "")).upper()
+            ps = str(o.get("positionSide", "")).upper()
+            side = str(o.get("side", "")).upper()
+            otype = str(o.get("type", "")).upper()
+            
+            orig_qty = dec(o.get("origQty", 0))
+            exec_qty = dec(o.get("executedQty", 0))
+            remain_qty = max(orig_qty - exec_qty, D(0))
+            
+            order_record: Dict[str, Any] = {
+                "orderId": str(o.get("orderId", "")),
+                "clientOrderId": cid,
+                "owner": order_owner if order_owner else "UNOWNED",
+                "symbol": sym,
+                "positionSide": ps,
+                "side": side,
+                "type": otype,
+                "status": status,
+                "origQty": str(orig_qty),
+                "executedQty": str(exec_qty),
+                "remainingQty": str(remain_qty),
+                "stopPrice": str(o.get("stopPrice", "") or ""),
+                "price": str(o.get("price", "") or ""),
+                "reduceOnly": bool(o.get("reduceOnly", False)),
+            }
+            
+            if "workingType" in o and o["workingType"]:
+                order_record["workingType"] = str(o["workingType"]).upper()
+            if "priceProtect" in o:
+                order_record["priceProtect"] = bool(o["priceProtect"])
+            
+            result["orders"].append(order_record)
+            
+            # Aggregate STOP_MARKET and TAKE_PROFIT_MARKET coverage
+            if sym and ps and remain_qty > 0:
+                key = (sym, ps)
+                if key not in coverage_agg:
+                    coverage_agg[key] = {"stop_market_qty": D(0), "take_profit_qty": D(0)}
+                
+                if otype == "STOP_MARKET":
+                    coverage_agg[key]["stop_market_qty"] += remain_qty
+                elif otype == "TAKE_PROFIT_MARKET":
+                    coverage_agg[key]["take_profit_qty"] += remain_qty
+    
+    for (sym, side), cov in coverage_agg.items():
+        result["coverage"][f"{sym}:{side}"] = {
+            "stopMarketQty": str(cov["stop_market_qty"]),
+            "takeProfitQty": str(cov["take_profit_qty"]),
+        }
+    
+    return result
+
+
+def audit_format_json_line(audit_data: Dict[str, Any]) -> str:
+    """Deterministic single-line JSON for audit logging."""
+    return json.dumps(audit_data, separators=(",", ":"), sort_keys=True)
+
 
 class FillLedger:
     def __init__(self, path: Path):
@@ -5257,6 +5369,7 @@ class Bot:
             ScalperEngine(sym, self.client, self.md, self.news, self.account, self.exe, self.store) for sym in SYMBOLS
         ] if SCALPER_ENGINE_ENABLED else []
         self.last_hb = 0.0
+        self._last_audit_log_ms = 0  # Periodic open orders audit logging
 
     def _broken_bankroll_reset_completed(self) -> bool:
         with self.store.lock:
@@ -6651,6 +6764,17 @@ class Bot:
                     if p and p > 0:
                         try: e.tick(p)
                         except Exception as ex: logger.exception(f"SCALPER TICK FAIL | {e.id} | {ex}")
+                # AUDIT: periodic open orders snapshot (read-only observation)
+                _now_audit = now_ms()
+                if _now_audit - self._last_audit_log_ms >= 60000:  # ~60 seconds
+                    self._last_audit_log_ms = _now_audit
+                    try:
+                        audit_data = audit_extract_open_orders_and_positions(self.reconciler, self.ledger)
+                        audit_line = audit_format_json_line(audit_data)
+                        logger.info(f"OPEN_ORDERS_AUDIT {audit_line}")
+                    except Exception as _audit_ex:
+                        logger.debug(f"AUDIT EXTRACTION FAILED | {_audit_ex}")
+
                 self.heartbeat()
             except KeyboardInterrupt:
                 break
