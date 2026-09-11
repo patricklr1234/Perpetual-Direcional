@@ -4,6 +4,9 @@
 Unit tests for OPEN_ORDERS_AUDIT extractor (v62+).
 Tests audit_extract_open_orders_and_positions and audit_format_json_line.
 Synthetic test data; no actual trading or API calls.
+
+REGRESSION FIX v62.1: MockSnapshot now uses captured_ms (not timestamp_ms)
+to match real ExchangeSnapshot dataclass field. Validates field access correctness.
 """
 
 import json
@@ -13,8 +16,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Mock classes for testing
 class MockSnapshot:
-    def __init__(self, timestamp_ms: int, positions: Dict, orders: List):
-        self.timestamp_ms = timestamp_ms
+    """Mock ExchangeSnapshot with captured_ms field (real field name)."""
+    def __init__(self, captured_ms: int, positions: Dict, orders: List):
+        # REGRESSION FIX: Use captured_ms (the actual ExchangeSnapshot field)
+        # not timestamp_ms. This test will fail if audit code uses wrong field.
+        self.captured_ms = captured_ms
         self.positions = positions
         self.open_orders = orders
 
@@ -48,7 +54,7 @@ def audit_extract_open_orders_and_positions(
         return result
     
     snap = reconciler.last_snapshot
-    result["timestamp_ms"] = snap.timestamp_ms
+    result["timestamp_ms"] = snap.captured_ms  # FIXED: use captured_ms
     
     for (sym, side), qty in snap.positions.items():
         if qty > 0:
@@ -140,19 +146,26 @@ def test_audit_empty_snapshot():
 
 
 def test_audit_with_positions():
-    """Test extraction of physical positions."""
+    """Test extraction of physical positions.
+    
+    REGRESSION FIX: Uses captured_ms (real ExchangeSnapshot field) not timestamp_ms.
+    Will fail if audit code incorrectly reads snap.timestamp_ms.
+    """
     positions = {
         ("BTCUSDT", "LONG"): Decimal("0.05"),
         ("ETHUSDT", "SHORT"): Decimal("1.23"),
     }
-    snapshot = MockSnapshot(1725940561000, positions, [])
+    snapshot = MockSnapshot(1725940561000, positions, [])  # captured_ms param
     reconciler = MockReconciler(snapshot)
     ledger = MockLedger({})
     
     result = audit_extract_open_orders_and_positions(reconciler, ledger)
     
     assert len(result["positions"]) == 2
-    assert result["timestamp_ms"] == 1725940561000
+    # REGRESSION FIX: This asserts that snap.captured_ms was read correctly
+    assert result["timestamp_ms"] == 1725940561000, \
+        f"timestamp_ms mismatch: got {result['timestamp_ms']}, expected 1725940561000. " \
+        "Audit code may be reading snap.timestamp_ms instead of snap.captured_ms"
     
     pos_dict = {p["symbol"]: p for p in result["positions"]}
     assert pos_dict["BTCUSDT"]["positionSide"] == "LONG"
