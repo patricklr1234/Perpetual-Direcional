@@ -162,11 +162,67 @@ def _pyramid_tick_v67(self, price):
 
 bot.PyramidEngine.tick = _pyramid_tick_v67
 bot.VERSION = f"{bot.VERSION}-side-flat-runtime-release-v67"
+# v68: stepped native profit-lock for PYRAMID, measured from operational anchor.
+# User policy: at +5% from anchor lock +1% above/below physical average entry;
+# from +10%, advance another 1% for every complete +2% favorable move.
+_original_effective_native_stop_v68 = bot.PyramidEngine._effective_native_stop_price
+
+
+def _profit_lock_pct_v68(favorable_from_anchor):
+    f = bot.dec(favorable_from_anchor)
+    if f < bot.D("0.05"):
+        return bot.D(0)
+    if f < bot.D("0.10"):
+        return bot.D("0.01")
+    steps = int((f - bot.D("0.10")) / bot.D("0.02"))
+    return bot.D("0.02") + bot.D(steps) * bot.D("0.01")
+
+
+def _physical_entry_v68(engine):
+    try:
+        p = engine._physical_position_snapshot() or {}
+        for k in ("entryPrice", "entry_price"):
+            v = bot.dec(p.get(k))
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    return engine._weighted_entry_price()
+
+
+def _effective_native_stop_v68(self, mark):
+    target, meta = _original_effective_native_stop_v68(self, mark)
+    st = self.st()
+    anchor = bot.dec(st.get("anchor"))
+    entry = _physical_entry_v68(self)
+    mark = bot.dec(mark)
+    if anchor <= 0 or entry <= 0 or mark <= 0:
+        return target, meta
+    favorable = ((mark / anchor) - bot.D(1)) if self.side == "LONG" else ((anchor / mark) - bot.D(1))
+    lock_pct = _profit_lock_pct_v68(favorable)
+    if lock_pct <= 0:
+        return target, meta
+    raw = entry * (bot.D(1) + lock_pct) if self.side == "LONG" else entry * (bot.D(1) - lock_pct)
+    direction = "DOWN" if self.side == "LONG" else "UP"
+    lock_stop = self.exe.rules.trigger_price(self.symbol, raw, direction)
+    if target is None:
+        chosen = lock_stop
+    else:
+        chosen = max(target, lock_stop) if self.side == "LONG" else min(target, lock_stop)
+    valid = chosen < mark if self.side == "LONG" else chosen > mark
+    meta = dict(meta or {})
+    meta.update({"profit_lock_v68": lock_stop, "profit_lock_pct": lock_pct, "favorable_from_anchor": favorable, "physical_entry_v68": entry})
+    return (chosen if valid else None), meta
+
+
+bot.PyramidEngine._effective_native_stop_price = _effective_native_stop_v68
+
+bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68"
 
 
 def main() -> None:
     bot.logger.warning(
-        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v67 | marker=%s | "
+        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v68 | profit_lock=anchor:+5%=>entry+1%; +10%=>entry+2%; every+2%=>+1% | marker=%s | "
         "policy=EXACT_SIDE_PROOF; OPPOSITE_SIDE_UNTOUCHED; ACCOUNTING_PRESERVED",
         MARKER,
     )
