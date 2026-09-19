@@ -18,6 +18,24 @@ import runner as base
 
 bot = base.bot
 MARKER = "EXCHANGE_FLAT_RECOVERY_UNACCOUNTED"
+
+# v70: Direcional uses CROSS margin for BTC/ETH/HYPE.
+# This overrides the legacy startup routine in main.py that forced ISOLATED.
+# No position is closed and no market order is sent by this migration.
+def _ensure_modes_cross_v70(self):
+    if not bot.LIVE_TRADING:
+        bot.logger.info("MODES | simulacao: nao altera Hedge/CROSS")
+        return
+    self.client.set_single_asset_mode()
+    bot.logger.info("MODES | Single-Asset Mode confirmado")
+    self.client.set_hedge_mode()
+    if not self.client.position_mode():
+        raise RuntimeError("Conta nao esta em Hedge Mode")
+    for symbol in bot.SYMBOLS:
+        self.client.set_margin_type(symbol, False)
+    bot.logger.info("MODES | Hedge Mode confirmado | CROSS solicitado em %s", ",".join(bot.SYMBOLS))
+
+bot.AccountManager.ensure_modes = _ensure_modes_cross_v70
 _original_pyramid_tick_v66 = bot.PyramidEngine.tick
 
 
@@ -217,12 +235,12 @@ def _effective_native_stop_v68(self, mark):
 
 bot.PyramidEngine._effective_native_stop_price = _effective_native_stop_v68
 
-bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68-monotonic-v69"
+bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68-monotonic-v69-cross-v70"
 
 
 def main() -> None:
     bot.logger.warning(
-        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v69 | profit_lock=anchor:+5%=>entry+1%; +10%=>entry+2%; every+2%=>+1%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
+        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v70 | margin=CROSS | profit_lock=anchor:+5%=>entry+1%; +10%=>entry+2%; every+2%=>+1%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
         "policy=EXACT_SIDE_PROOF; OPPOSITE_SIDE_UNTOUCHED; ACCOUNTING_PRESERVED",
         MARKER,
     )
