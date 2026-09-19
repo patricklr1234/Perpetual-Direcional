@@ -367,15 +367,11 @@ bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68-monotonic-v69-cross-v70-ado
 
 def main() -> None:
     bot.logger.warning(
-        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v71 | margin=CROSS | profit_lock=anchor:+5%%=>entry+1%%; +10%%=>entry+2%%; every+2%%=>+1%%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
+        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v74 | margin=CROSS | profit_lock=anchor:+5%%=>entry+1%%; +10%%=>entry+2%%; every+2%%=>+1%%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
         "policy=EXACT_SIDE_PROOF; OPPOSITE_SIDE_UNTOUCHED; ACCOUNTING_PRESERVED",
         MARKER,
     )
     base.main()
-
-
-if __name__ == "__main__":
-    main()
 
 
 # PRE_MIGRATION_TRAILING_V73
@@ -437,7 +433,7 @@ def _effective_native_stop_v73(self, mark):
     return chosen, meta
 
 bot.PyramidEngine._effective_native_stop_price = _effective_native_stop_v73
-bot.VERSION = f"{bot.VERSION}-premigration-trailing-v73"
+bot.VERSION = f"{bot.VERSION}-premigration-trailing-v73-loadorder-v74"
 
 
 # MARGIN LOG FIX V72
@@ -455,3 +451,7 @@ def _info_cross_log_v72(msg, *args, **kwargs):
     return _original_info_v72(msg, *args, **kwargs)
 
 bot.logger.info = _info_cross_log_v72
+
+
+if __name__ == "__main__":
+    main()
