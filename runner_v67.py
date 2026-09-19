@@ -367,7 +367,7 @@ bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68-monotonic-v69-cross-v70-ado
 
 def main() -> None:
     bot.logger.warning(
-        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v74 | margin=CROSS | profit_lock=anchor:+5%%=>entry+1%%; +10%%=>entry+2%%; every+2%%=>+1%%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
+        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v75 | margin=CROSS | profit_lock=anchor:+5%%=>entry+1%%; +10%%=>entry+2%%; every+2%%=>+1%%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
         "policy=EXACT_SIDE_PROOF; OPPOSITE_SIDE_UNTOUCHED; ACCOUNTING_PRESERVED",
         MARKER,
     )
@@ -433,7 +433,33 @@ def _effective_native_stop_v73(self, mark):
     return chosen, meta
 
 bot.PyramidEngine._effective_native_stop_price = _effective_native_stop_v73
-bot.VERSION = f"{bot.VERSION}-premigration-trailing-v73-loadorder-v74"
+
+# V75: force one safe refresh after startup so stale v71/v72 native stops are
+# replaced immediately by the continuity target computed above. This does not
+# submit entries or close positions; it uses the existing native-stop replace
+# path (verify -> cancel old protective stop -> install new protective stop).
+_original_tick_v74 = bot.PyramidEngine.tick
+_v75_refreshed = set()
+
+def _tick_force_continuity_refresh_v75(self, price):
+    key = str(self.id)
+    if self.side == "LONG" and self.symbol in _PRE_MIGRATION_TRAILING_V73 and key not in _v75_refreshed:
+        maintenance = self.store.state.get("maintenance", {})
+        adopted = (maintenance.get(_MIGRATION_MARKER_V71) or {}).get("completed")
+        if adopted and (self.st().get("legs") or []):
+            ok = self._ensure_native_risk_stop(bot.dec(price), force=True)
+            if ok:
+                _v75_refreshed.add(key)
+                bot.logger.warning(
+                    "PRE-MIGRATION TRAILING V75 | REFRESH CONFIRMED | %s | target=%s",
+                    self.id, (self.st().get("native_risk_stop") or {}).get("target_price"),
+                )
+            else:
+                bot.logger.error("PRE-MIGRATION TRAILING V75 | REFRESH NOT CONFIRMED | %s", self.id)
+    return _original_tick_v74(self, price)
+
+bot.PyramidEngine.tick = _tick_force_continuity_refresh_v75
+bot.VERSION = f"{bot.VERSION}-premigration-trailing-v73-loadorder-v74-refresh-v75"
 
 
 # MARGIN LOG FIX V72
