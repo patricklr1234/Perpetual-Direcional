@@ -217,12 +217,12 @@ def _effective_native_stop_v68(self, mark):
 
 bot.PyramidEngine._effective_native_stop_price = _effective_native_stop_v68
 
-bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68"
+bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68-monotonic-v69"
 
 
 def main() -> None:
     bot.logger.warning(
-        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v68 | profit_lock=anchor:+5%=>entry+1%; +10%=>entry+2%; every+2%=>+1% | marker=%s | "
+        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v69 | profit_lock=anchor:+5%=>entry+1%; +10%=>entry+2%; every+2%=>+1%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
         "policy=EXACT_SIDE_PROOF; OPPOSITE_SIDE_UNTOUCHED; ACCOUNTING_PRESERVED",
         MARKER,
     )
