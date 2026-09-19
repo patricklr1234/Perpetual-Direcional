@@ -367,7 +367,7 @@ bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68-monotonic-v69-cross-v70-ado
 
 def main() -> None:
     bot.logger.warning(
-        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v75 | margin=CROSS | profit_lock=anchor:+5%%=>entry+1%%; +10%%=>entry+2%%; every+2%%=>+1%%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
+        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v76 | margin=CROSS | profit_lock=anchor:+5%%=>entry+1%%; +10%%=>entry+2%%; every+2%%=>+1%%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
         "policy=EXACT_SIDE_PROOF; OPPOSITE_SIDE_UNTOUCHED; ACCOUNTING_PRESERVED",
         MARKER,
     )
@@ -459,7 +459,7 @@ def _tick_force_continuity_refresh_v75(self, price):
     return _original_tick_v74(self, price)
 
 bot.PyramidEngine.tick = _tick_force_continuity_refresh_v75
-bot.VERSION = f"{bot.VERSION}-premigration-trailing-v73-loadorder-v74-refresh-v75"
+bot.VERSION = f"{bot.VERSION}-premigration-trailing-v73-loadorder-v74-refresh-v75-health-cross-v76"
 
 
 # MARGIN LOG FIX V72
@@ -470,8 +470,14 @@ _original_info_v72 = bot.logger.info
 
 def _info_cross_log_v72(msg, *args, **kwargs):
     rendered = str(msg)
-    if rendered.startswith("MARGIN=ISOLATED | MODE=HEDGE"):
+    # V76: normalize both the startup banner and HEALTH SNAPSHOT legacy text.
+    # This is telemetry-only; actual exchange margin mode remains controlled by v70.
+    if "MARGIN=ISOLATED | MODE=HEDGE" in rendered:
         rendered = rendered.replace("MARGIN=ISOLATED", "MARGIN=CROSS", 1)
+        msg = rendered
+        args = ()
+    elif "HEALTH SNAPSHOT |" in rendered and "margin=ISOLATED" in rendered:
+        rendered = rendered.replace("margin=ISOLATED", "margin=CROSS", 1)
         msg = rendered
         args = ()
     return _original_info_v72(msg, *args, **kwargs)
