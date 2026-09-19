@@ -362,7 +362,7 @@ def _effective_native_stop_v68(self, mark):
 
 bot.PyramidEngine._effective_native_stop_price = _effective_native_stop_v68
 
-bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68-monotonic-v69-cross-v70-adopt-v71"
+bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68-monotonic-v69-cross-v70-adopt-v71-log-v72"
 
 
 def main() -> None:
@@ -376,3 +376,20 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# MARGIN LOG FIX V72
+# main.py still has a legacy informational banner hard-coded as ISOLATED.
+# Runtime mode is CROSS (v70+). Suppress only that stale banner and emit the
+# authoritative CROSS banner; no trading/risk/order behavior is changed.
+_original_info_v72 = bot.logger.info
+
+def _info_cross_log_v72(msg, *args, **kwargs):
+    rendered = str(msg)
+    if rendered.startswith("MARGIN=ISOLATED | MODE=HEDGE"):
+        rendered = rendered.replace("MARGIN=ISOLATED", "MARGIN=CROSS", 1)
+        msg = rendered
+        args = ()
+    return _original_info_v72(msg, *args, **kwargs)
+
+bot.logger.info = _info_cross_log_v72
