@@ -36,6 +36,133 @@ def _ensure_modes_cross_v70(self):
     bot.logger.info("MODES | Hedge Mode confirmado | CROSS solicitado em %s", ",".join(bot.SYMBOLS))
 
 bot.AccountManager.ensure_modes = _ensure_modes_cross_v70
+
+
+# v71: one-shot adoption of the three user-reconstructed LONG positions after
+# the ISOLATED -> CROSS migration. This never submits an entry order. It runs
+# only when physical quantities AND the three manually restored protective
+# stops exactly match the migration manifest, while ledger/state ownership is
+# still zero. Afterwards normal PYRAMID ownership/protection logic resumes.
+_MIGRATION_V71 = {
+    "BTCUSDT": {"qty": bot.D("0.002"), "stop": bot.D("77810.5"), "next_level": 3},
+    "ETHUSDT": {"qty": bot.D("0.051"), "stop": bot.D("2484.87"), "next_level": 5},
+    "HYPEUSDT": {"qty": bot.D("2.19"), "stop": bot.D("86.341"), "next_level": 15},
+}
+_MIGRATION_MARKER_V71 = "cross_manual_reconstruction_adopted_v71"
+_original_reconcile_v70 = bot.Reconciler.reconcile
+
+
+def _adopt_cross_reconstruction_v71(reconciler):
+    if not bot.LIVE_TRADING:
+        return False
+    with reconciler.store.lock:
+        maintenance = reconciler.store.state.setdefault("maintenance", {})
+        if (maintenance.get(_MIGRATION_MARKER_V71) or {}).get("completed"):
+            return False
+
+    # This repair is intentionally impossible to trigger on a partial/different
+    # portfolio: exact three LONG quantities, no SHORT exposure, empty durable
+    # ownership, empty PYRAMID state and exact manual STOP_MARKET prices required.
+    snap = reconciler.snapshot()
+    expected_physical = {(s, "LONG"): v["qty"] for s, v in _MIGRATION_V71.items()}
+    actual = {k: bot.dec(v) for k, v in snap.positions.items() if bot.dec(v) > 0}
+    if set(actual) != set(expected_physical):
+        return False
+    for key, wanted in expected_physical.items():
+        step = reconciler.rules.rules[key[0]].step_size
+        if abs(bot.dec(actual.get(key)) - wanted) >= step:
+            return False
+    if any(bot.dec(q) > 0 for q in reconciler.ledger.open_by_symbol_side().values()):
+        return False
+    if any(bot.dec(q) > 0 for q in reconciler.expected_from_state_by_symbol_side().values()):
+        return False
+
+    manual_stops = {}
+    for order in snap.open_orders or []:
+        sym = str(order.get("symbol") or "").upper()
+        ps = str(order.get("positionSide") or "").upper()
+        typ = str(order.get("type") or "").upper()
+        status = str(order.get("status") or "NEW").upper()
+        if sym not in _MIGRATION_V71 or ps != "LONG" or typ != "STOP_MARKET" or status not in ("NEW", "PARTIALLY_FILLED"):
+            continue
+        sp = bot.dec(order.get("stopPrice"))
+        tick = reconciler.rules.rules[sym].tick_size
+        if abs(sp - _MIGRATION_V71[sym]["stop"]) <= max(tick, tick * bot.D(2)):
+            manual_stops[sym] = order
+    if set(manual_stops) != set(_MIGRATION_V71):
+        return False
+
+    adopted = []
+    with reconciler.store.lock:
+        for sym, spec in _MIGRATION_V71.items():
+            key = f"{sym}:LONG"
+            st = reconciler.store.state["pyramid"][key]
+            if st.get("legs") or st.get("native_risk_stop"):
+                raise RuntimeError(f"V71_ADOPTION_STATE_NOT_EMPTY:{key}")
+            entry = bot.dec(snap.entry_prices.get((sym, "LONG")))
+            if entry <= 0:
+                raise RuntimeError(f"V71_ADOPTION_ENTRY_MISSING:{sym}")
+            leg_id = f"migration-v71-{sym.lower()}-long"
+            leg = {
+                "id": leg_id, "side": "LONG", "qty": str(spec["qty"]),
+                "entry_price": str(entry), "signal_price": str(entry),
+                "price_source": "EXCHANGE_POSITION_RECONSTRUCTION",
+                "leverage": bot.PYRAMID_LEVERAGE,
+                "requested_leverage": bot.PYRAMID_LEVERAGE,
+                "notional": str(spec["qty"] * entry),
+                "margin_est": str((spec["qty"] * entry) / bot.D(bot.PYRAMID_LEVERAGE)),
+                "opened_at": bot.now_iso(), "reason": "CROSS_MANUAL_RECONSTRUCTION_V71",
+            }
+            reconciler.ledger.record_open_lot(
+                leg_id, f"PYRAMID:{sym}:LONG", sym, "LONG",
+                spec["qty"], entry, leg_id, "MANUAL_CROSS_RECONSTRUCTION_V71",
+            )
+            order = manual_stops[sym]
+            cid = str(order.get("clientOrderId") or order.get("origClientOrderId") or "")
+            st["legs"] = [leg]
+            st["next_level"] = int(spec["next_level"])
+            st["levels_filled"] = max(1, int(spec["next_level"]) - 1)
+            st["last_trigger_price"] = str(entry)
+            st["stopped"] = False
+            st["stop_reason"] = None
+            st["native_risk_stop"] = {
+                "target_price": str(spec["stop"]),
+                "orders": [{
+                    "position_side": "LONG", "qty": str(spec["qty"]),
+                    "client_id": cid, "order_id": order.get("orderId"),
+                    "type": "STOP_MARKET", "stop_price": str(spec["stop"]),
+                    "status": status,
+                }],
+                "installed_at": bot.now_iso(),
+                "adopted_manual": True,
+            }
+            st["last_update"] = bot.now_iso()
+            adopted.append({"symbol": sym, "qty": str(spec["qty"]), "entry": str(entry),
+                            "stop": str(spec["stop"]), "next_level": int(spec["next_level"])})
+        maintenance[_MIGRATION_MARKER_V71] = {
+            "completed": True, "completed_at": bot.now_iso(), "adopted": adopted,
+            "policy": "EXACT_PHYSICAL+EXACT_MANUAL_STOPS+EMPTY_LEDGER_STATE; ONE_SHOT",
+        }
+        reconciler.store.save()
+
+    reconciler.store.set_trade_gate(True, None)
+    reconciler.store.clear_soft_position_mismatch()
+    bot.logger.warning("CROSS RECONSTRUCTION ADOPT V71 | COMPLETE | %s", adopted)
+    return True
+
+
+def _reconcile_with_cross_adoption_v71(self):
+    try:
+        _adopt_cross_reconstruction_v71(self)
+    except Exception as exc:
+        reason = f"CROSS_RECONSTRUCTION_V71_FAILED:{exc}"
+        self.store.set_trade_gate(False, reason)
+        bot.logger.exception("CROSS RECONSTRUCTION ADOPT V71 | FAIL CLOSED | %s", reason)
+        return False
+    return _original_reconcile_v70(self)
+
+
+bot.Reconciler.reconcile = _reconcile_with_cross_adoption_v71
 _original_pyramid_tick_v66 = bot.PyramidEngine.tick
 
 
@@ -235,12 +362,12 @@ def _effective_native_stop_v68(self, mark):
 
 bot.PyramidEngine._effective_native_stop_price = _effective_native_stop_v68
 
-bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68-monotonic-v69-cross-v70"
+bot.VERSION = f"{bot.VERSION}-anchor-profit-lock-v68-monotonic-v69-cross-v70-adopt-v71"
 
 
 def main() -> None:
     bot.logger.warning(
-        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v70 | margin=CROSS | profit_lock=anchor:+5%=>entry+1%; +10%=>entry+2%; every+2%=>+1%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
+        "PYRAMID SIDE-FLAT RUNTIME RELEASE FIX ACTIVE | version=v71 | margin=CROSS | profit_lock=anchor:+5%%=>entry+1%%; +10%%=>entry+2%%; every+2%%=>+1%%; monotonic=NEVER_LOOSEN_NATIVE_STOP | marker=%s | "
         "policy=EXACT_SIDE_PROOF; OPPOSITE_SIDE_UNTOUCHED; ACCOUNTING_PRESERVED",
         MARKER,
     )
