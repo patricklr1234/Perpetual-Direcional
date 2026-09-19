@@ -378,6 +378,68 @@ if __name__ == "__main__":
     main()
 
 
+# PRE_MIGRATION_TRAILING_V73
+# The CROSS reconstruction created new exchange entry prices, but economically
+# these positions continue the pre-migration PYRAMID baskets. Preserve the last
+# confirmed pre-migration trailing stops instead of tightening them to the
+# 1%-adverse stop of the reconstructed exchange entries. Once the normal v68/v69
+# profit-lock produces a stop stricter than this legacy floor, monotonic trailing
+# resumes from the stricter value and can never loosen again.
+_PRE_MIGRATION_TRAILING_V73 = {
+    "BTCUSDT": bot.D("77810.5"),
+    "ETHUSDT": bot.D("2484.87"),
+    "HYPEUSDT": bot.D("86.341"),
+}
+_effective_native_stop_v72 = bot.PyramidEngine._effective_native_stop_price
+
+def _effective_native_stop_v73(self, mark):
+    target, meta = _effective_native_stop_v72(self, mark)
+    if self.side != "LONG" or self.symbol not in _PRE_MIGRATION_TRAILING_V73:
+        return target, meta
+    maintenance = self.store.state.get("maintenance", {})
+    adopted = (maintenance.get(_MIGRATION_MARKER_V71) or {}).get("completed")
+    if not adopted:
+        return target, meta
+    legacy = _PRE_MIGRATION_TRAILING_V73[self.symbol]
+    # v68/v69 target includes the reconstructed-entry max-loss stop. During this
+    # continuity bridge that component must not tighten the inherited basket.
+    # Only a genuine profit-lock step may supersede the inherited stop.
+    physical_entry = _physical_entry_v68(self)
+    anchor = bot.dec(self.st().get("anchor"))
+    lock_target = None
+    favorable = bot.D(0)
+    lock_pct = bot.D(0)
+    if anchor > 0 and physical_entry > 0:
+        favorable = (mark / anchor) - bot.D(1)
+        lock_pct = _profit_lock_pct_v68(favorable)
+        if lock_pct > 0:
+            raw = physical_entry * (bot.D(1) + lock_pct)
+            lock_target = self.exe.rules.trigger_price(self.symbol, raw, "DOWN")
+    chosen = legacy
+    if lock_target is not None and lock_target > chosen:
+        chosen = lock_target
+    # Never loosen an already-live bot-owned stop.
+    existing = self.st().get("native_risk_stop") or {}
+    old = bot.dec(existing.get("target_price"))
+    if old > 0 and old != target and old > chosen:
+        chosen = old
+    if chosen >= mark:
+        return target, meta
+    meta = dict(meta or {})
+    meta.update({
+        "continuity_v73": True,
+        "pre_migration_stop": legacy,
+        "profit_lock_only_target": lock_target,
+        "favorable_from_anchor": favorable,
+        "profit_lock_pct": lock_pct,
+        "reconstructed_entry_max_loss_ignored": True,
+    })
+    return chosen, meta
+
+bot.PyramidEngine._effective_native_stop_price = _effective_native_stop_v73
+bot.VERSION = f"{bot.VERSION}-premigration-trailing-v73"
+
+
 # MARGIN LOG FIX V72
 # main.py still has a legacy informational banner hard-coded as ISOLATED.
 # Runtime mode is CROSS (v70+). Suppress only that stale banner and emit the
