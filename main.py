@@ -5661,6 +5661,148 @@ class Bot:
 
         return False
 
+    def release_stale_protection_blocks_if_flat(self) -> None:
+        """Clear only stale protection blocks after independently proving the strategy is flat.
+
+        Safety invariants:
+          - never closes/cancels anything;
+          - never mutates the durable fill ledger;
+          - never clears a block while state, ledger, physical position, or open
+            protective orders still show exposure;
+          - only clears protection blocks belonging to the affected strategy.
+        """
+        if not LIVE_TRADING:
+            return
+
+        stale_reasons = (
+            "PYRAMID_NATIVE_STOP_INSTALL_FAILED",
+            "PYRAMID_NATIVE_STOP_NOT_INSTALLED",
+            "PYRAMID_NATIVE_STOP_VERIFY_UNKNOWN",
+        )
+        released = []
+        skipped = []
+
+        with self.store.lock:
+            blocks = dict(self.store.state.get("protection_blocks", {}) or {})
+
+        for strategy_id, reason in blocks.items():
+            reason_text = str(reason or "").upper()
+            if not any(marker in reason_text for marker in stale_reasons):
+                continue
+
+            try:
+                symbol = ""
+                side = ""
+                state_qty = D(0)
+                native_stop = None
+
+                if str(strategy_id).startswith("PYRAMID:"):
+                    parts = str(strategy_id).split(":")
+                    if len(parts) >= 3:
+                        symbol = parts[1].upper()
+                        side = parts[2].upper()
+                    with self.store.lock:
+                        candidates = []
+                        for bucket in ("pyramid", "pyramid_grids"):
+                            for st in (self.store.state.get(bucket, {}) or {}).values():
+                                if not isinstance(st, dict):
+                                    continue
+                                sid = str(st.get("strategy") or "")
+                                if sid == strategy_id:
+                                    candidates.append(st)
+                        if candidates:
+                            state_qty = sum(
+                                (
+                                    dec(leg.get("qty"))
+                                    for st in candidates
+                                    for leg in (st.get("legs", []) or [])
+                                ),
+                                D(0),
+                            )
+                            native_stop = any(
+                                bool(st.get("native_risk_stop"))
+                                for st in candidates
+                            )
+
+                elif str(strategy_id).startswith("SCALPER:"):
+                    symbol = str(strategy_id).split(":", 1)[1].upper()
+                    with self.store.lock:
+                        st = (self.store.state.get("scalper", {}) or {}).get(symbol, {}) or {}
+                        pos = st.get("position") or {}
+                        leg = pos.get("leg") if isinstance(pos, dict) else None
+                        if isinstance(leg, dict):
+                            state_qty = dec(leg.get("qty"))
+                            side = str(leg.get("side") or "").upper()
+                        native_stop = bool(st.get("native_risk_stop"))
+
+                if not symbol or side not in ("LONG", "SHORT"):
+                    skipped.append((strategy_id, "INVALID_STRATEGY_ID"))
+                    continue
+
+                ledger_qty = self.ledger.open_strategy_qty(strategy_id, symbol, side)
+
+                rows = self.client.positions(symbol)
+                if not isinstance(rows, list):
+                    raise RuntimeError("positionRisk indeterminado")
+                physical_qty = D(0)
+                for row in rows:
+                    if (
+                        str(row.get("symbol") or "").upper() == symbol
+                        and str(row.get("positionSide") or "").upper() == side
+                    ):
+                        physical_qty = abs(dec(row.get("positionAmt")))
+                        break
+
+                orders = self.client.open_orders(symbol)
+                if not isinstance(orders, list):
+                    raise RuntimeError("openOrders indeterminado")
+                side_orders = [
+                    o for o in orders
+                    if str(o.get("positionSide") or "").upper() == side
+                    and not bool(o.get("closePosition"))
+                    and dec(o.get("origQty") or o.get("quantity") or "0") > 0
+                ]
+
+                step = self.rules.rules[symbol].step_size if symbol in self.rules.rules else D("0.00000001")
+                flat = (
+                    state_qty < step
+                    and ledger_qty < step
+                    and physical_qty < step
+                    and not native_stop
+                    and not side_orders
+                )
+                if not flat:
+                    skipped.append(
+                        (
+                            strategy_id,
+                            f"NOT_FLAT:state={state_qty};ledger={ledger_qty};physical={physical_qty};"
+                            f"native_stop={bool(native_stop)};orders={len(side_orders)}",
+                        )
+                    )
+                    continue
+
+                self.store.set_protection_block(strategy_id, None)
+                released.append(strategy_id)
+                logger.warning(
+                    "STALE PROTECTION BLOCK AUTO-RELEASE | strategy=%s | flat=CONFIRMED | "
+                    "reason=%s | no_position=no_ledger=no_state_stop=no_open_orders",
+                    strategy_id,
+                    reason,
+                )
+            except Exception as exc:
+                skipped.append((strategy_id, f"VERIFY_FAILED:{exc}"))
+                logger.exception(
+                    "STALE PROTECTION BLOCK AUTO-RELEASE | SKIP FAIL-CLOSED | strategy=%s",
+                    strategy_id,
+                )
+
+        if released or skipped:
+            logger.warning(
+                "STALE PROTECTION BLOCK AUTO-RELEASE COMPLETE | released=%s skipped=%s",
+                released,
+                skipped,
+            )
+
     def retry_pending_bankroll_reset_after_reconcile(self) -> None:
         """Finish the one-shot reset as soon as an old pending exposure becomes flat."""
         if not self._pending_bankroll_reset_has_flat_candidate():
@@ -6465,6 +6607,7 @@ class Bot:
             # Release stale exchange-flat recovery stops only after reconciliation and
             # an independent per-side proof that exchange/state/ledger/orders are flat.
             self.release_exchange_flat_recovery_blocks()
+            self.release_stale_protection_blocks_if_flat()
             # User-requested one-shot reset of bankrolls that already broke. This runs
             # only after ledger/state/physical reconciliation has succeeded.
             self.reset_broken_bankrolls_to_initial()
@@ -7064,6 +7207,9 @@ class Bot:
                     self._last_periodic_reconcile_ms = _now_reconcile
                     try:
                         self.reconciler.reconcile()
+                        # Clear only stale native-stop installation blocks after the
+                        # reconciliation has independently confirmed a flat strategy.
+                        self.release_stale_protection_blocks_if_flat()
                         # V59.5: a one-shot bankroll reset that was blocked by an old
                         # live exposure now completes automatically once reconciliation
                         # proves that at least one pending strategy became flat.
