@@ -5764,13 +5764,27 @@ class Bot:
                 ]
 
                 step = self.rules.rules[symbol].step_size if symbol in self.rules.rules else D("0.00000001")
+                # A persisted native_risk_stop is metadata describing a protection
+                # that must be represented by an actual exchange position/order.  When
+                # state, ledger and physical exposure are all flat and there are no
+                # exchange orders on this Hedge-Mode side, that metadata is stale by
+                # definition and must not keep a strategy permanently entry-blocked.
+                # We still fail closed whenever physical exposure or exchange orders are
+                # indeterminate/present; no order cancellation or position mutation is
+                # performed here.
                 flat = (
                     state_qty < step
                     and ledger_qty < step
                     and physical_qty < step
-                    and not native_stop
                     and not side_orders
                 )
+                if flat and native_stop:
+                    logger.warning(
+                        "STALE NATIVE STOP METADATA | strategy=%s | "
+                        "state=0 ledger=0 physical=0 orders=0 | clearing metadata only",
+                        strategy_id,
+                    )
+                    native_stop = None
                 if not flat:
                     skipped.append(
                         (
